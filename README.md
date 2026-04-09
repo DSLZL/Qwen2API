@@ -1,5 +1,7 @@
 <div align="center">
 
+> [🇷🇺 Русская версия / Russian version](README-ru.md)
+
 # 🚀 Qwen-Proxy
 
 [![Version](https://img.shields.io/badge/version-2026.04.06.12.30-blue.svg)](https://github.com/Rfym21/Qwen2API)
