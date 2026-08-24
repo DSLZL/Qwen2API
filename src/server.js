@@ -40,10 +40,15 @@ app.get('/api/csrf-token', (req, res) => {
   res.json({ csrfToken: token, csrfSecret: secret })
 })
 
+// 没有凭证可用的公开端点：管理面板登录接口
+const CSRF_EXEMPT_PATHS = new Set(['/verify'])
+
 // CSRF validation middleware for state-changing browser requests
 // API key clients (Authorization / x-api-key header) are exempt
 const csrfProtect = (req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next()
+  // 登录请求本身没有凭证可带——它就是登录。放行后仍由 /verify 自己校验 apiKey。
+  if (CSRF_EXEMPT_PATHS.has(req.path)) return next()
   if (req.headers['authorization'] || req.headers['x-api-key']) return next()
   const secret = req.headers['x-csrf-secret']
   const token = req.headers['x-csrf-token']
