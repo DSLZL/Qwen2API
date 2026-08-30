@@ -574,6 +574,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // OpenAI 路径正是为此每轮新建（openai-agent-runtime.js 顶部注释）。
   let parser = null;
   let nativeToolAccumulator = null;
+  // 本轮抢救回来的原文。按轮清空，且在回合定案之前绝不写到线上：
+  // 提前写会让每一次重试都再吐一份同样的垃圾，而末尾的 error 事件又会把
+  // 已经发出去的内容块全部作废。
+  let recoveredBuffer = '';
   let agentTagStripper = null;
   let normalizeDelta = null;
   let acceptUpstreamFrame = null;
@@ -586,6 +590,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // buildToolSystemPrompt 让模型把最终答复包进 <agent_final>...</agent_final>，
     // 但本控制器没有 Agent 回合门禁去解包，标签会原样发给客户端。剥掉它们。
     agentTagStripper = createAgentTagStripper();
+    recoveredBuffer = '';
     normalizeDelta = createUpstreamDeltaNormalizer();
     acceptUpstreamFrame = createUpstreamResponseFilter();
     upstreamFinishReason = null;
@@ -645,9 +650,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
    * 输出一段文本增量；按需打开新文本块
    * @param {string} text - 文本增量
    */
-  const emitTextDelta = (text) => {
+  const emitTextDelta = (text, { countsAsVisible = true } = {}) => {
     if (!text) return;
-    visibleText += text;
+    if (countsAsVisible) visibleText += text;
     if (!textBlockOpen) {
       closeThinkingBlockIfOpen();
       blockIndex += 1;
@@ -741,6 +746,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       if (parser) {
         const parsed = parser.push(content);
         if (parsed.textDelta) emitTextDelta(agentTagStripper.push(parsed.textDelta));
+        recoveredBuffer += parsed.recoveredText;
         for (const call of parsed.completedCalls) emitToolUse(call);
       } else {
         emitTextDelta(agentTagStripper.push(content));
@@ -809,6 +815,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     if (parser) {
       const tail = parser.flush();
       if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
+      recoveredBuffer += tail.recoveredText;
       for (const call of tail.completedCalls) emitToolUse(call);
     }
     // 缓冲区里可能压着一个最终没能凑成标签的前缀，它是正文，必须放出来。
@@ -830,6 +837,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // 都依赖它。还没写过正文时才放开到 maxAttempts，而上报的故障恰好是这种形状：
     // 一轮纯 <tool_call> 且工具名无效不产生任何可见正文，所以 6 次尝试都够得着。
     if (visibleText.trim()) {
+      // tool_error 是唯一一种"这一轮本身就是垃圾"的拒绝理由：模型复述工具协议时，
+      // 回显里的字面标签必然解析失败。此时重试只会把第二轮拼在已经发出去的第一轮
+      // 后面，客户端看到同一段垃圾两遍。required / missing_tool 不受影响。
+      if (retryReason === 'tool_error') break;
       if (retriedAfterVisibleText) break;
       retriedAfterVisibleText = true;
     }
@@ -854,10 +865,24 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   }
 
   const finalToolErrors = currentToolErrors();
+  // 有真正的正文时，工具错误不再升级成 502：客户端已经收到了一段回答，再补一个
+  // error 事件只会让整条消息作废。判据是**正文**，不含抢救回来的原文 —— 一轮里除了
+  // 一个残缺的 <tool_call> 什么都没有时，把裸 XML 当成回答交出去比明说失败更糟。
+  // tool_choice=required 例外 —— 那是没有兑现的契约，不是残次品。
   const hasToolProtocolError = !!(
     !hasEmittedToolCalls &&
-    (requiresToolCall(toolChoice) || finalToolErrors.length > 0)
+    (requiresToolCall(toolChoice) || (finalToolErrors.length > 0 && !visibleText.trim()))
   );
+
+  if (!hasToolProtocolError && recoveredBuffer) {
+    emitTextDelta(stripAgentTags(recoveredBuffer), { countsAsVisible: false });
+  }
+  if (!hasToolProtocolError && finalToolErrors.length > 0) {
+    logger.warning?.(
+      `Anthropic Agent 工具协议出错但已产出内容，按正常回答返回 (${describeToolErrors(finalToolErrors)})`,
+      'ANTHROPIC'
+    );
+  }
 
   if (hasToolProtocolError) {
     // 这个细节以前存在于 getErrors() 里却被丢掉，于是三种截然不同的原因

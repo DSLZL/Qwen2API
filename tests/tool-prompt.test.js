@@ -170,3 +170,69 @@ test('tolerant tags: history is still written in the canonical form', () => {
   assert.match(folded[0].content, /<tool_call>/)
   assert.doesNotMatch(folded[0].content, /<tool_calls>/i)
 })
+
+// El modelo a veces repite su propio prompt de herramientas. Ese texto trae tags
+// <tool_call> literales, el parser los consume y el parseo falla. Antes se descartaba
+// en silencio y la frase quedaba cortada; devolver solo el payload pegaba los
+// caracteres de los lados. Hay que devolver el tramo completo, tags incluidos, y en un
+// campo aparte de textDelta.
+const ECHOED_PROMPT = 'Rules: your visible response MUST be a `<tool_call>` block. Call the tool instead.'
+
+test('salvage: el parser de stream reconstruye la frase carácter por carácter', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  let text = ''
+  let recovered = ''
+  for (const ch of ECHOED_PROMPT) {
+    const out = parser.push(ch)
+    text += out.textDelta
+    recovered += out.recoveredText
+  }
+  const tail = parser.flush()
+  text += tail.textDelta
+  recovered += tail.recoveredText
+
+  assert.equal(text + recovered, ECHOED_PROMPT, 'la frase no se reconstruye idéntica')
+  // El backtick de apertura sale en textDelta (va antes del tag) y el resto en recoveredText:
+  // lo que importa es que al unirlos el par de backticks siga envolviendo al tag.
+  assert.match(text + recovered, /`<tool_call>` block/, 'los tags son parte de la frase y deben volver')
+  assert.match(recovered, /^<tool_call>/, 'el tramo rescatado arranca en el tag consumido')
+  assert.equal(parser.hasEmittedAnyCall(), false)
+  assert.equal(parser.getErrors()[0].type, 'invalid_json')
+  // Separación load-bearing: si esto viajara en textDelta, el controlador lo tomaría
+  // como "el modelo ya respondió" y bloquearía justo el reintento más recuperable.
+  assert.doesNotMatch(text, /Call the tool instead/)
+})
+
+test('salvage: el parser de stream devuelve el tag aunque el payload venga vacío', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  const out = parser.push('texto<tool_call>')
+  const tail = parser.flush()
+  assert.equal(out.textDelta + out.recoveredText + tail.textDelta + tail.recoveredText, 'texto<tool_call>')
+})
+
+test('salvage: el parser de texto completo conserva el tramo entero', () => {
+  const echoed = parseToolCallsFromText(ECHOED_PROMPT, { allowedToolNames: ['read_file'] })
+  assert.equal(echoed.toolCalls.length, 0)
+  assert.equal(echoed.cleanedText, ECHOED_PROMPT)
+  assert.equal(echoed.errors[0].type, 'truncated_tool_call')
+
+  const unknown = parseToolCallsFromText(
+    '<tool_call>{"name":"Bash","arguments":{}}</tool_call>',
+    { allowedToolNames: ['read_file'] }
+  )
+  assert.equal(unknown.toolCalls.length, 0)
+  assert.equal(unknown.errors[0].type, 'unknown_tool')
+  assert.match(unknown.cleanedText, /^<tool_call>.*<\/tool_call>$/, 'el tramo rechazado debe volver entero')
+
+  // El tramo rechazado vuelve al texto CON sus tags; el escaneo de "tag sin cerrar"
+  // no debe volver a mirarlo y fabricar una llamada desde un bloque ya rechazado.
+  assert.equal(unknown.errors.length, 1, 'un bloque rechazado generó un segundo error')
+
+  // Las llamadas realmente consumidas siguen saliendo del texto.
+  const good = parseToolCallsFromText(
+    'before<tool_call>{"name":"read_file","arguments":{}}</tool_call>after',
+    { allowedToolNames: ['read_file'] }
+  )
+  assert.equal(good.toolCalls.length, 1)
+  assert.equal(good.cleanedText, 'beforeafter')
+})

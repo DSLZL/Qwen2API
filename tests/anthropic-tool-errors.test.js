@@ -154,3 +154,62 @@ describe('retrying never duplicates what the client already received', () => {
     assert.deepEqual(toolUseNames(res.output), []);
   });
 });
+
+// El fallo reportado: el modelo repite su propio prompt de herramientas. El eco trae
+// tags <tool_call> literales, el parser los consume, y antes de este cambio el texto
+// tragado desaparecía (frase cortada a la mitad).
+const ECHOED_PROMPT = 'Rules: your visible response MUST be a `<tool_call>` block. Call the tool instead.';
+
+/** Reconstruye lo que el cliente ve como respuesta, sin escapes de SSE. */
+const visibleTextOf = (output) =>
+  [...output.matchAll(/"delta":\{"type":"text_delta","text":("(?:[^"\\]|\\.)*")\}/g)]
+    .map(m => JSON.parse(m[1]))
+    .join('');
+
+describe('an echoed tool protocol is delivered whole, once', () => {
+  it('delivers the sentence character-for-character, backticks included', async () => {
+    const res = await runStream(turn(ECHOED_PROMPT), scriptedSender());
+    assert.equal(visibleTextOf(res.output), ECHOED_PROMPT);
+    assert.deepEqual(toolUseNames(res.output), []);
+  });
+
+  it('completes the message instead of aborting it with a 502', async () => {
+    const res = await runStream(turn(ECHOED_PROMPT), scriptedSender());
+    assert.doesNotMatch(res.output, /invalid_tool_call_error/);
+    assert.match(res.output, /"type":"message_stop"/);
+  });
+
+  it('does not retry once real prose is on the wire, so nothing is doubled', async () => {
+    const sender = scriptedSender(turn(ECHOED_PROMPT), turn(ECHOED_PROMPT));
+    const res = await runStream(turn(ECHOED_PROMPT), sender);
+    assert.equal(sender.calls.length, 0, 'tool_error must not retry after visible text');
+    assert.equal(visibleTextOf(res.output), ECHOED_PROMPT, 'la salida llegó duplicada');
+  });
+
+  it('emits the salvaged payload at most once, however many attempts ran', async () => {
+    // Tres intentos, todos con un nombre inventado y sin prosa. El rescate de cada
+    // intento se descarta al reintentar; el turno cierra con un error explícito en vez
+    // de entregar XML crudo como si fuera la respuesta.
+    const sender = scriptedSender(turn(BAD_NAME), turn(BAD_NAME), turn(BAD_NAME));
+    const res = await runStream(turn(BAD_NAME), sender);
+    assert.equal(visibleTextOf(res.output), '', 'el payload rescatado se filtró como respuesta');
+    assert.match(res.output, /invalid_tool_call_error/);
+    assert.match(res.output, /连续 3 次/);
+  });
+
+  it('never writes an error event after a content block', async () => {
+    const res = await runStream(turn(ECHOED_PROMPT), scriptedSender());
+    const firstContent = res.output.indexOf('content_block_start');
+    const errorAt = res.output.indexOf('"type":"error"');
+    assert.ok(firstContent !== -1, 'no se emitió contenido');
+    assert.equal(errorAt, -1, 'un error event invalida todo el contenido ya enviado');
+  });
+
+  it('still retries a bad tool call when no prose reached the client', async () => {
+    // La guarda es específica de "ya salió prosa": el payload rescatado no cuenta.
+    const sender = scriptedSender(turn(GOOD_CALL));
+    const res = await runStream(turn(BAD_NAME), sender);
+    assert.equal(sender.calls.length, 1);
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+  });
+});
