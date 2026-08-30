@@ -80,6 +80,55 @@ test('phase-less answer content is not silently discarded', () => {
   })
 })
 
+// Defect A: Upstream role:"function" deltas are Qwen's own tool results, not the assistant
+test('Defect A: upstream role:function deltas are dropped', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  // Qwen injects tool-registry results as role:"function" deltas with content like "Tool X does not exists."
+  const result = normalize({
+    role: 'function',
+    phase: 'answer',
+    name: 'read_file',
+    content: 'Tool read_file does not exists.'
+  })
+  assert.equal(result, null, 'role:function delta should be dropped, not emitted as text')
+})
+
+test('Defect A: role:function with phase:code_interpreter is dropped', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  // Sandbox results from Qwen also use role:function
+  const result = normalize({
+    role: 'function',
+    phase: 'code_interpreter',
+    extra: { tool_result: 'some output' }
+  })
+  assert.equal(result, null, 'role:function sandbox result should be dropped')
+})
+
+test('Defect A: normal role:assistant answers pass through', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  const result = normalize({
+    role: 'assistant',
+    phase: 'answer',
+    content: 'Here is the answer'
+  })
+  assert.deepEqual(result, {
+    phase: 'answer',
+    content: 'Here is the answer'
+  }, 'normal assistant messages should pass through unchanged')
+})
+
+test('Defect A: thinking deltas pass through even with no role', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  const result = normalize({
+    phase: 'think',
+    content: 'thinking about this...'
+  })
+  assert.deepEqual(result, {
+    phase: 'think',
+    content: 'thinking about this...'
+  }, 'thinking deltas should pass through')
+})
+
 test('finish reasons preserve truncation instead of reporting normal completion', () => {
   assert.equal(normalizeOpenAIFinishReason('length', false, true), 'length')
   assert.equal(normalizeOpenAIFinishReason(null, false, false), null)

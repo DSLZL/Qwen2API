@@ -516,6 +516,17 @@ const createUpstreamDeltaNormalizer = () => {
     let summaryThoughtCount = 0
     return (delta) => {
         if (!delta) return null
+
+        // Defect A: Drop Qwen's own tool-registry results (role="function").
+        // These are upstream injections, never the assistant's answer.
+        if (delta.role === 'function') {
+            logger.warn(
+                `Dropped upstream role:function delta with phase "${delta.phase}" and name "${delta.name || 'unknown'}"`,
+                'UPSTREAM_NORMALIZER'
+            )
+            return null
+        }
+
         const rawPhase = delta.phase
         const hasReasoningContent = typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0
         const hasContent = typeof delta.content === 'string' && delta.content.length > 0
