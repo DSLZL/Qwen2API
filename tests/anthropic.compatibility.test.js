@@ -22,7 +22,7 @@ test('analyzeAnthropicCompatibility classifies supported partial ignored and fut
 
   assert.deepEqual(result.supportedFields, ['model', 'messages', 'stream']);
   assert.deepEqual(result.partialFields, ['system', 'tools', 'tool_choice', 'thinking']);
-  assert.deepEqual(result.ignoredFields, ['max_tokens', 'metadata', 'output_config']);
+  assert.deepEqual(result.ignoredFields, ['metadata', 'output_config']);
   assert.deepEqual(result.futureRiskFields, ['context_management']);
   assert.match(result.summary, /partial/i);
   assert.match(result.summary, /ignored/i);

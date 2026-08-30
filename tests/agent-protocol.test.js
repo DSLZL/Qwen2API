@@ -1107,3 +1107,39 @@ test('AGENT_TURN_ACCEPT_BARE_FINAL 打开后按 stop 接受，空正文仍判为
     )
   })
 })
+
+// La ruta OpenAI viva es el turn gate (handleStreamResponse retorna temprano a
+// handleOpenAIAgentStream siempre que has_tools sea truthy). Si el modelo cita el tag
+// literal en el canal de razonamiento de un turno que el gate acepta, ese texto debe
+// llegar entero: antes el parser se lo tragaba y la frase salía cortada en el tag.
+//
+// El mismo eco en el canal de respuesta NO llega: el gate estricto lo marca
+// invalid_tool_call y, como ya salió texto, cierra con 422
+// upstream_agent_stream_invalidated. Eso es comportamiento deliberado del gate
+// (tests "默认严格模式" + los switches AGENT_TURN_*), no algo que este cambio toque.
+// Anotado en deferred-work.md.
+test('an echoed <tool_call> in accepted reasoning reaches the client whole', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"think","content":"Use a `<tool_call>` block next time."},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"delta":{"phase":"answer","content":"<agent_final>done</agent_final>"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    ]),
+    true,
+    false,
+    { messages: [{ role: 'user', content: 'explain the protocol' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => { retries += 1 }
+    }
+  )
+
+  assert.equal(retries, 0, 'el turno era aceptable; no debía reintentarse')
+  assert.match(res.output, /Use a /)
+  assert.match(res.output, /block next time\./, 'la frase llegó cortada en el tag')
+  assert.doesNotMatch(res.output, /upstream_agent|invalid_tool_call/)
+})

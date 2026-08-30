@@ -28,6 +28,19 @@ const apiKeyVerify = (req, res, next) => {
   const { isValid, isAdmin } = validateApiKey(apiKey)
 
   if (!isValid) {
+    // Anthropic-compatible error schema for Claude Code clients.
+    // Detect by x-api-key header or /v1/messages path — Claude Code always
+    // sends x-api-key and hits /v1/messages. Accept header not required
+    // (curl tests and some SDK versions omit it).
+    const isAnthropicClient = !!(
+      req.headers['x-api-key'] || req.path?.startsWith('/v1/messages')
+    )
+    if (isAnthropicClient) {
+      return res.status(401).json({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Invalid API key' }
+      })
+    }
     return res.status(401).json({ error: 'Unauthorized' })
   }
 

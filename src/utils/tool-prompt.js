@@ -19,6 +19,23 @@ const TOOL_CALL_OPEN = '<tool_call>';
  */
 const TOOL_CALL_CLOSE = '</tool_call>';
 
+/**
+ * 宽松的标签识别。模型偶尔写成 `<TOOL_CALL>`、`<tool_call >` 或 `<tool_calls>`；
+ * 这些都不等于字面量，于是整段 XML 作为正文泄漏给客户端，而且**不记录任何错误** ——
+ * 既不触发 502 也不触发补偿重试，调用方只看到一段裸 XML。
+ *
+ * 只放宽三点：大小写、标签内空白、复数 `s`。故意不接受任意属性，好让标签长度有上界；
+ * 流式解析要在 chunk 边界上暂存可能被切断的标签，无界的标签会让缓冲区也无界。
+ * 因此 `<tool_call id="1">` 仍然会泄漏，是已知且有意的缺口。
+ *
+ * 只影响**读取**。foldToolMessages 回写历史时仍然使用上面的规范形式。
+ */
+const TOOL_CALL_OPEN_RE = /<[ \t]{0,4}tool_calls?[ \t]{0,4}>/i;
+const TOOL_CALL_CLOSE_RE = /<[ \t]{0,4}\/[ \t]{0,4}tool_calls?[ \t]{0,4}>/i;
+
+/** 上面两个正则能匹配的最长标签，用作 chunk 边界暂存区的上界。 */
+const TOOL_CALL_TAG_MAX = '</    tool_calls    >'.length;
+
 const normalizeAllowedToolNames = (allowedToolNames) => {
   if (!allowedToolNames) return null;
   const names = allowedToolNames instanceof Set ? allowedToolNames : new Set(allowedToolNames);
@@ -296,42 +313,61 @@ const parseToolCallPayload = (raw) => {
  * @returns {{ cleanedText: string, toolCalls: Array<Object>, errors: Array<Object> }} 抽取结果
  */
 const parseToolCallsFromText = (fullText, options = {}) => {
-  if (typeof fullText !== 'string' || !fullText.includes(TOOL_CALL_OPEN)) {
+  if (typeof fullText !== 'string' || !TOOL_CALL_OPEN_RE.test(fullText)) {
     return { cleanedText: fullText || '', toolCalls: [], errors: [] };
   }
 
   const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
   const toolCalls = [];
   const errors = [];
-  const pattern = /<tool_call>([\s\S]*?)<\/tool_call>/g;
-  const cleanedText = fullText.replace(pattern, (_, inner) => {
+  // 每次调用新建：带 /g 的正则会保留 lastIndex，模块级共享会让第二次调用漏掉开头的匹配。
+  const closedPair = () => new RegExp(
+    `${TOOL_CALL_OPEN_RE.source}([\\s\\S]*?)${TOOL_CALL_CLOSE_RE.source}`,
+    'gi'
+  );
+
+  // 先在**原文**上定位那个没有闭合的开标签，再去处理成对的块。
+  // 顺序反过来会出事：解析失败的块现在要连标签一起留在正文里，如果之后再去
+  // 扫描"未闭合的开标签"，就会扫到那段已经被判定失败的文本，把它的负载重新
+  // 当成一个工具调用 —— 从一个已经拒绝的块里凭空造出调用。
+  // 掩码用等长填充，保证 index 仍然对得上原文。
+  const masked = fullText.replace(closedPair(), (match) => '\u0000'.repeat(match.length));
+  const unclosed = masked.match(TOOL_CALL_OPEN_RE);
+  const body = unclosed ? fullText.slice(0, unclosed.index) : fullText;
+  const tailOpen = unclosed ? unclosed[0] : '';
+  const tailRaw = unclosed ? fullText.slice(unclosed.index + unclosed[0].length) : '';
+
+  // 只有真正被消费成工具调用的块才从正文里移除。失败的块连标签一起还回去：
+  // 标签本身就是句子的一部分（"your visible response MUST be a `<tool_call>` block"），
+  // 只还负载会把两侧的字符黏在一起。
+  let cleanedText = body.replace(closedPair(), (match, inner) => {
     const payload = parseToolCallPayload(inner);
     if (!payload) {
       errors.push({ type: 'invalid_json', raw: inner });
-    } else if (allowedToolNames && !allowedToolNames.has(payload.name)) {
-      errors.push({ type: 'unknown_tool', name: payload.name });
-    } else {
-      toolCalls.push(createToolCallObject(payload, toolCalls.length));
+      return match;
     }
+    if (allowedToolNames && !allowedToolNames.has(payload.name)) {
+      errors.push({ type: 'unknown_tool', name: payload.name });
+      return match;
+    }
+    toolCalls.push(createToolCallObject(payload, toolCalls.length));
     return '';
   });
 
-  const unclosedIndex = cleanedText.indexOf(TOOL_CALL_OPEN);
-  let finalText = cleanedText;
-  if (unclosedIndex !== -1) {
-    const raw = cleanedText.slice(unclosedIndex + TOOL_CALL_OPEN.length);
-    const payload = parseToolCallPayload(raw);
+  if (unclosed) {
+    const payload = parseToolCallPayload(tailRaw);
     if (!payload) {
-      errors.push({ type: 'truncated_tool_call', raw });
+      errors.push({ type: 'truncated_tool_call', raw: tailRaw });
+      cleanedText += tailOpen + tailRaw;
     } else if (allowedToolNames && !allowedToolNames.has(payload.name)) {
       errors.push({ type: 'unknown_tool', name: payload.name });
+      cleanedText += tailOpen + tailRaw;
     } else {
       toolCalls.push(createToolCallObject(payload, toolCalls.length));
     }
-    finalText = cleanedText.slice(0, unclosedIndex);
   }
 
-  return { cleanedText: finalText.trim(), toolCalls, errors };
+  return { cleanedText: cleanedText.trim(), toolCalls, errors };
 };
 
 /**
@@ -350,16 +386,27 @@ const createToolCallStreamParser = (options = {}) => {
   let pendingText = '';
   let inToolCall = false;
   let toolCallBuffer = '';
+  let openTagText = '';
   let emittedCallCount = 0;
   const errors = [];
 
-  const acceptPayload = (payload, raw, result) => {
+  // 解析失败时，把整段原文（含标签）还给调用方 —— 但放在 recoveredText 里，不是
+  // textDelta。模型偶尔会把工具协议的说明原样复述出来，那段文字里带着字面的
+  // <tool_call>，于是这里判定失败。以前直接丢弃，可见回答就在标签处拦腰截断；
+  // 只还负载又会把标签两侧的字符黏在一起（`` 而不是 `<tool_call>`）。
+  //
+  // 为什么必须和 textDelta 分开：调用方用"是否已经写过正文"来决定能不能重试。
+  // 抢救回来的文字是"这一轮失败了"的证据，不是模型给出的回答；一旦混进 textDelta，
+  // 恰恰最该重试的那一轮（残缺 / 工具名无效）就再也重试不了。
+  const acceptPayload = (payload, raw, result, span) => {
     if (!payload) {
       errors.push({ type: 'invalid_json', raw });
+      result.recoveredText += span;
       return;
     }
     if (allowedToolNames && !allowedToolNames.has(payload.name)) {
       errors.push({ type: 'unknown_tool', name: payload.name });
+      result.recoveredText += span;
       return;
     }
     result.completedCalls.push(createToolCallObject(payload, emittedCallCount));
@@ -372,22 +419,22 @@ const createToolCallStreamParser = (options = {}) => {
    * @returns {{ safe: string, remainder: string }} 切分结果
    */
   const splitSafeText = (text) => {
-    const openIdx = text.indexOf(TOOL_CALL_OPEN);
-    if (openIdx !== -1) {
-      return { safe: text.slice(0, openIdx), remainder: text.slice(openIdx) };
+    const openMatch = text.match(TOOL_CALL_OPEN_RE);
+    if (openMatch) {
+      return { safe: text.slice(0, openMatch.index), remainder: text.slice(openMatch.index) };
     }
-    const maxCheck = Math.min(text.length, TOOL_CALL_OPEN.length - 1);
-    for (let len = maxCheck; len > 0; len--) {
-      const tail = text.slice(text.length - len);
-      if (TOOL_CALL_OPEN.startsWith(tail)) {
-        return { safe: text.slice(0, text.length - len), remainder: tail };
-      }
+    // 标签可能被切在两个 chunk 中间。宽松匹配无法像字面量那样逐前缀试探，改为按上界暂存：
+    // 从最后一个 '<' 起若不超过一个标签的长度，就留到下一段再判断。正文里孤立的 '<'
+    // 最多延迟 TOOL_CALL_TAG_MAX 个字符，flush() 兜底放出。
+    const lastOpen = text.lastIndexOf('<');
+    if (lastOpen !== -1 && text.length - lastOpen <= TOOL_CALL_TAG_MAX) {
+      return { safe: text.slice(0, lastOpen), remainder: text.slice(lastOpen) };
     }
     return { safe: text, remainder: '' };
   };
 
   const push = (chunk) => {
-    const result = { textDelta: '', completedCalls: [] };
+    const result = { textDelta: '', recoveredText: '', completedCalls: [] };
     if (typeof chunk !== 'string' || chunk.length === 0) return result;
 
     let buffer = chunk;
@@ -396,15 +443,16 @@ const createToolCallStreamParser = (options = {}) => {
       if (inToolCall) {
         toolCallBuffer += buffer;
         buffer = '';
-        const closeIdx = toolCallBuffer.indexOf(TOOL_CALL_CLOSE);
-        if (closeIdx === -1) {
+        const closeMatch = toolCallBuffer.match(TOOL_CALL_CLOSE_RE);
+        if (!closeMatch) {
           break;
         }
-        const inner = toolCallBuffer.slice(0, closeIdx);
-        buffer = toolCallBuffer.slice(closeIdx + TOOL_CALL_CLOSE.length);
+        const inner = toolCallBuffer.slice(0, closeMatch.index);
+        const span = openTagText + inner + closeMatch[0];
+        buffer = toolCallBuffer.slice(closeMatch.index + closeMatch[0].length);
         toolCallBuffer = '';
         const payload = parseToolCallPayload(inner);
-        acceptPayload(payload, inner, result);
+        acceptPayload(payload, inner, result, span);
         inToolCall = false;
         continue;
       }
@@ -412,12 +460,13 @@ const createToolCallStreamParser = (options = {}) => {
       pendingText += buffer;
       buffer = '';
 
-      const openIdx = pendingText.indexOf(TOOL_CALL_OPEN);
-      if (openIdx !== -1) {
-        const before = pendingText.slice(0, openIdx);
+      const openMatch = pendingText.match(TOOL_CALL_OPEN_RE);
+      if (openMatch) {
+        const before = pendingText.slice(0, openMatch.index);
         if (before) result.textDelta += before;
-        const tail = pendingText.slice(openIdx + TOOL_CALL_OPEN.length);
+        const tail = pendingText.slice(openMatch.index + openMatch[0].length);
         pendingText = '';
+        openTagText = openMatch[0];
         inToolCall = true;
         buffer = tail;
         continue;
@@ -432,10 +481,11 @@ const createToolCallStreamParser = (options = {}) => {
   };
 
   const flush = () => {
-    const result = { textDelta: '', completedCalls: [] };
-    if (inToolCall && toolCallBuffer) {
-      const payload = parseToolCallPayload(toolCallBuffer);
-      acceptPayload(payload, toolCallBuffer, result);
+    const result = { textDelta: '', recoveredText: '', completedCalls: [] };
+    if (inToolCall) {
+      // 开标签已经被消费掉了：哪怕负载是空的，也要把它还回去，否则整段消失。
+      const payload = toolCallBuffer ? parseToolCallPayload(toolCallBuffer) : null;
+      acceptPayload(payload, toolCallBuffer, result, openTagText + toolCallBuffer);
       toolCallBuffer = '';
       inToolCall = false;
     }

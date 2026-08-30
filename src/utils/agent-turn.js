@@ -186,6 +186,70 @@ const createAgentControlStreamParser = () => {
   }
 }
 
+const AGENT_CONTROL_TAGS = [
+  AGENT_FINAL_OPEN,
+  AGENT_FINAL_CLOSE,
+  AGENT_BLOCKED_OPEN,
+  AGENT_BLOCKED_CLOSE
+]
+
+/**
+ * 从可见正文中剥离 Agent 回合包装标签。
+ *
+ * /v1/messages 注入的是与 OpenAI 路径同一份工具提示词，所以模型同样会输出
+ * <agent_final>...</agent_final>；但 Anthropic 控制器没有接 Agent 回合门禁，
+ * 标签因此原样透传给客户端。这里只做剥离，不做合法性判定：没有门禁就没有
+ * 重生回合的地方，把“散文 + 包装”的回合判成 invalid 只会让整个回合失败。
+ *
+ * 流式必须缓冲：标签可能被切在两个 chunk 中间。push 只返回确定不属于标签的
+ * 前缀，结束时必须调用一次 flush 取回缓冲区，否则末尾文本会丢。缓冲区最多
+ * 保留一个标签长度的前缀，不会随流增长。
+ */
+const createAgentTagStripper = () => {
+  let pending = ''
+
+  const push = (chunk) => {
+    if (typeof chunk !== 'string' || !chunk) return ''
+    pending += chunk
+    let out = ''
+    for (;;) {
+      const start = pending.indexOf('<')
+      if (start === -1) {
+        out += pending
+        pending = ''
+        return out
+      }
+      out += pending.slice(0, start)
+      pending = pending.slice(start)
+
+      const lower = pending.toLowerCase()
+      const matched = AGENT_CONTROL_TAGS.find(tag => lower.startsWith(tag.toLowerCase()))
+      if (matched) {
+        pending = pending.slice(matched.length)
+        continue
+      }
+      // 可能是被 chunk 边界切断的标签前缀：留在缓冲区等下一段。
+      if (AGENT_CONTROL_TAGS.some(tag => tag.toLowerCase().startsWith(lower))) return out
+      // 确定不是标签：'<' 属于正文，跳过它继续扫描。
+      out += '<'
+      pending = pending.slice(1)
+    }
+  }
+
+  const flush = () => {
+    const rest = pending
+    pending = ''
+    return rest
+  }
+
+  return { push, flush }
+}
+
+const stripAgentTags = (value) => {
+  const stripper = createAgentTagStripper()
+  return `${stripper.push(String(value || ''))}${stripper.flush()}`
+}
+
 const buildAgentTurnDirective = ({ afterToolResult = false } = {}) => {
   const continuation = afterToolResult
     ? 'The current message is a tool result from the same unfinished task. It is evidence to inspect, not a new task and not a reason to stop after one action.'
@@ -230,6 +294,8 @@ module.exports = {
   AGENT_BLOCKED_CLOSE,
   parseAgentControlText,
   createAgentControlStreamParser,
+  createAgentTagStripper,
+  stripAgentTags,
   buildAgentTurnDirective,
   buildAgentRetryHint
 }

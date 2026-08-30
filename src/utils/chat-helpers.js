@@ -15,6 +15,9 @@ const MODEL_SUFFIXES = [
     '-image'
 ]
 
+// ponytail: no hardcoded claude→qwen mapping. Users set model in Claude Code config directly.
+// Non-claude names pass through to upstream via existing parserModel lookup.
+
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
 
@@ -235,7 +238,7 @@ const isThinkingEnabled = async (model, enable_thinking, thinking_budget) => {
         thinking_config.thinking_enabled = true
     }
 
-    if (thinking_budget && Number(thinking_budget) !== Number.NaN && Number(thinking_budget) > 0 && Number(thinking_budget) < 38912) {
+    if (thinking_budget && !Number.isNaN(Number(thinking_budget)) && Number(thinking_budget) > 0 && Number(thinking_budget) < 131072) {
         thinking_config.budget = Number(thinking_budget)
     }
 

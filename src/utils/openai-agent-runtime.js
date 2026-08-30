@@ -64,6 +64,11 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     ? createToolCallStreamParser({ allowedToolNames })
     : null
   let streamedVisibleText = ''
+  // Texto rescatado de un <tool_call> que no parseó. No se emite aquí: el turn gate
+  // todavía puede rechazar esta ronda, y emitirlo ahora lo duplicaría en cada intento
+  // además de contar como "ya salió texto" en la guarda de :409.
+  let recoveredContent = ''
+  let recoveredReasoning = ''
   let streamedControlKind = null
   let controlToolParserFlushed = false
 
@@ -89,11 +94,13 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     if (result.textDelta) {
       const parsed = controlToolStreamParser.push(result.textDelta)
       await emitContentDelta(parsed.textDelta, result.kind)
+      recoveredContent += parsed.recoveredText
     }
     if (result.closed && !controlToolParserFlushed) {
       controlToolParserFlushed = true
       const parsed = controlToolStreamParser.flush()
       await emitContentDelta(parsed.textDelta, result.kind)
+      recoveredContent += parsed.recoveredText
     }
   }
 
@@ -194,6 +201,7 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       if (reasoningStreamParser) {
         const streamed = reasoningStreamParser.push(normalized.content)
         await emitReasoningDelta(streamed.textDelta)
+        recoveredReasoning += streamed.recoveredText
       }
       return
     }
@@ -210,6 +218,7 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   if (reasoningStreamParser) {
     const streamed = reasoningStreamParser.flush()
     await emitReasoningDelta(streamed.textDelta)
+    recoveredReasoning += streamed.recoveredText
   }
   if (controlStreamParser) {
     await consumeControlStreamResult(controlStreamParser.flush())
@@ -253,6 +262,8 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     visibleText: control.text,
     controlKind: control.kind,
     streamedVisibleText,
+    recoveredContent,
+    recoveredReasoning,
     streamedControlKind,
     streamedControlState: controlStreamParser?.getState?.() || null,
     toolCalls,
@@ -394,6 +405,17 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     upstreamContext = mergePresent(upstreamContext, attempt.metadata)
 
     if (evaluation.accepted) {
+      // Solo ahora que la ronda quedó aceptada: si se hubiera emitido al vuelo, cada
+      // intento rechazado habría dejado otra copia en el stream del cliente.
+      if (attempt.recoveredReasoning && typeof options.on_reasoning_delta === 'function') {
+        await options.on_reasoning_delta(attempt.recoveredReasoning, { attemptNumber })
+      }
+      if (attempt.recoveredContent && typeof options.on_content_delta === 'function') {
+        await options.on_content_delta(attempt.recoveredContent, {
+          attemptNumber,
+          kind: attempt.streamedControlKind
+        })
+      }
       return {
         ok: true,
         attempt,
