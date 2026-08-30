@@ -11,6 +11,7 @@ const {
   createNativeToolCallAccumulator,
   looksLikeUnexecutedToolAction
 } = require('../utils/tool-prompt.js');
+const { createAgentTagStripper, stripAgentTags } = require('../utils/agent-turn.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
@@ -530,6 +531,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let visibleText = '';
 
   const parser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null;
+  // buildToolSystemPrompt 让模型把最终答复包进 <agent_final>...</agent_final>，
+  // 但本控制器没有 Agent 回合门禁去解包，标签会原样发给客户端。剥掉它们。
+  const agentTagStripper = createAgentTagStripper();
   const nativeToolAccumulator = hasTools
     ? createNativeToolCallAccumulator({ allowedToolNames })
     : null;
@@ -685,10 +689,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     } else if (delta.phase === 'answer') {
       if (parser) {
         const parsed = parser.push(content);
-        if (parsed.textDelta) emitTextDelta(parsed.textDelta);
+        if (parsed.textDelta) emitTextDelta(agentTagStripper.push(parsed.textDelta));
         for (const call of parsed.completedCalls) emitToolUse(call);
       } else {
-        emitTextDelta(content);
+        emitTextDelta(agentTagStripper.push(content));
       }
     }
   };
@@ -755,9 +759,11 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 
   if (parser) {
     const tail = parser.flush();
-    if (tail.textDelta) emitTextDelta(tail.textDelta);
+    if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
     for (const call of tail.completedCalls) emitToolUse(call);
   }
+  // 缓冲区里可能压着一个最终没能凑成标签的前缀，它是正文，必须放出来。
+  emitTextDelta(agentTagStripper.flush());
 
   const nativeToolCalls = nativeToolAccumulator?.hasAny()
     ? nativeToolAccumulator.finalize()
@@ -918,7 +924,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let parsedTools = hasTools
     ? parseToolCallsFromText(answerContent, { allowedToolNames })
     : { cleanedText: answerContent, toolCalls: [], errors: [] };
-  let cleanedText = parsedTools.cleanedText;
+  let cleanedText = stripAgentTags(parsedTools.cleanedText);
   let nativeToolCalls = nativeToolAccumulator?.hasAny()
     ? nativeToolAccumulator.finalize()
     : [];
@@ -972,7 +978,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
           : [];
         toolCalls = [...nativeToolCalls, ...parsedRetry.toolCalls]
           .map((call, index) => ({ ...call, index }));
-        cleanedText = parsedRetry.cleanedText;
+        cleanedText = stripAgentTags(parsedRetry.cleanedText);
         toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
       }
     } catch (e) {
