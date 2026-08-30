@@ -19,6 +19,23 @@ const TOOL_CALL_OPEN = '<tool_call>';
  */
 const TOOL_CALL_CLOSE = '</tool_call>';
 
+/**
+ * 宽松的标签识别。模型偶尔写成 `<TOOL_CALL>`、`<tool_call >` 或 `<tool_calls>`；
+ * 这些都不等于字面量，于是整段 XML 作为正文泄漏给客户端，而且**不记录任何错误** ——
+ * 既不触发 502 也不触发补偿重试，调用方只看到一段裸 XML。
+ *
+ * 只放宽三点：大小写、标签内空白、复数 `s`。故意不接受任意属性，好让标签长度有上界；
+ * 流式解析要在 chunk 边界上暂存可能被切断的标签，无界的标签会让缓冲区也无界。
+ * 因此 `<tool_call id="1">` 仍然会泄漏，是已知且有意的缺口。
+ *
+ * 只影响**读取**。foldToolMessages 回写历史时仍然使用上面的规范形式。
+ */
+const TOOL_CALL_OPEN_RE = /<[ \t]{0,4}tool_calls?[ \t]{0,4}>/i;
+const TOOL_CALL_CLOSE_RE = /<[ \t]{0,4}\/[ \t]{0,4}tool_calls?[ \t]{0,4}>/i;
+
+/** 上面两个正则能匹配的最长标签，用作 chunk 边界暂存区的上界。 */
+const TOOL_CALL_TAG_MAX = '</    tool_calls    >'.length;
+
 const normalizeAllowedToolNames = (allowedToolNames) => {
   if (!allowedToolNames) return null;
   const names = allowedToolNames instanceof Set ? allowedToolNames : new Set(allowedToolNames);
@@ -296,14 +313,18 @@ const parseToolCallPayload = (raw) => {
  * @returns {{ cleanedText: string, toolCalls: Array<Object>, errors: Array<Object> }} 抽取结果
  */
 const parseToolCallsFromText = (fullText, options = {}) => {
-  if (typeof fullText !== 'string' || !fullText.includes(TOOL_CALL_OPEN)) {
+  if (typeof fullText !== 'string' || !TOOL_CALL_OPEN_RE.test(fullText)) {
     return { cleanedText: fullText || '', toolCalls: [], errors: [] };
   }
 
   const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
   const toolCalls = [];
   const errors = [];
-  const pattern = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+  // 每次调用新建：带 /g 的正则会保留 lastIndex，模块级共享会让第二次调用漏掉开头的匹配。
+  const pattern = new RegExp(
+    `${TOOL_CALL_OPEN_RE.source}([\\s\\S]*?)${TOOL_CALL_CLOSE_RE.source}`,
+    'gi'
+  );
   const cleanedText = fullText.replace(pattern, (_, inner) => {
     const payload = parseToolCallPayload(inner);
     if (!payload) {
@@ -316,10 +337,11 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     return '';
   });
 
-  const unclosedIndex = cleanedText.indexOf(TOOL_CALL_OPEN);
+  const unclosed = cleanedText.match(TOOL_CALL_OPEN_RE);
+  const unclosedIndex = unclosed ? unclosed.index : -1;
   let finalText = cleanedText;
   if (unclosedIndex !== -1) {
-    const raw = cleanedText.slice(unclosedIndex + TOOL_CALL_OPEN.length);
+    const raw = cleanedText.slice(unclosedIndex + unclosed[0].length);
     const payload = parseToolCallPayload(raw);
     if (!payload) {
       errors.push({ type: 'truncated_tool_call', raw });
@@ -372,16 +394,16 @@ const createToolCallStreamParser = (options = {}) => {
    * @returns {{ safe: string, remainder: string }} 切分结果
    */
   const splitSafeText = (text) => {
-    const openIdx = text.indexOf(TOOL_CALL_OPEN);
-    if (openIdx !== -1) {
-      return { safe: text.slice(0, openIdx), remainder: text.slice(openIdx) };
+    const openMatch = text.match(TOOL_CALL_OPEN_RE);
+    if (openMatch) {
+      return { safe: text.slice(0, openMatch.index), remainder: text.slice(openMatch.index) };
     }
-    const maxCheck = Math.min(text.length, TOOL_CALL_OPEN.length - 1);
-    for (let len = maxCheck; len > 0; len--) {
-      const tail = text.slice(text.length - len);
-      if (TOOL_CALL_OPEN.startsWith(tail)) {
-        return { safe: text.slice(0, text.length - len), remainder: tail };
-      }
+    // 标签可能被切在两个 chunk 中间。宽松匹配无法像字面量那样逐前缀试探，改为按上界暂存：
+    // 从最后一个 '<' 起若不超过一个标签的长度，就留到下一段再判断。正文里孤立的 '<'
+    // 最多延迟 TOOL_CALL_TAG_MAX 个字符，flush() 兜底放出。
+    const lastOpen = text.lastIndexOf('<');
+    if (lastOpen !== -1 && text.length - lastOpen <= TOOL_CALL_TAG_MAX) {
+      return { safe: text.slice(0, lastOpen), remainder: text.slice(lastOpen) };
     }
     return { safe: text, remainder: '' };
   };
@@ -396,12 +418,12 @@ const createToolCallStreamParser = (options = {}) => {
       if (inToolCall) {
         toolCallBuffer += buffer;
         buffer = '';
-        const closeIdx = toolCallBuffer.indexOf(TOOL_CALL_CLOSE);
-        if (closeIdx === -1) {
+        const closeMatch = toolCallBuffer.match(TOOL_CALL_CLOSE_RE);
+        if (!closeMatch) {
           break;
         }
-        const inner = toolCallBuffer.slice(0, closeIdx);
-        buffer = toolCallBuffer.slice(closeIdx + TOOL_CALL_CLOSE.length);
+        const inner = toolCallBuffer.slice(0, closeMatch.index);
+        buffer = toolCallBuffer.slice(closeMatch.index + closeMatch[0].length);
         toolCallBuffer = '';
         const payload = parseToolCallPayload(inner);
         acceptPayload(payload, inner, result);
@@ -412,11 +434,11 @@ const createToolCallStreamParser = (options = {}) => {
       pendingText += buffer;
       buffer = '';
 
-      const openIdx = pendingText.indexOf(TOOL_CALL_OPEN);
-      if (openIdx !== -1) {
-        const before = pendingText.slice(0, openIdx);
+      const openMatch = pendingText.match(TOOL_CALL_OPEN_RE);
+      if (openMatch) {
+        const before = pendingText.slice(0, openMatch.index);
         if (before) result.textDelta += before;
-        const tail = pendingText.slice(openIdx + TOOL_CALL_OPEN.length);
+        const tail = pendingText.slice(openMatch.index + openMatch[0].length);
         pendingText = '';
         inToolCall = true;
         buffer = tail;

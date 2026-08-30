@@ -11,7 +11,7 @@ const {
   createNativeToolCallAccumulator,
   looksLikeUnexecutedToolAction
 } = require('../utils/tool-prompt.js');
-const { createAgentTagStripper, stripAgentTags } = require('../utils/agent-turn.js');
+const { createAgentTagStripper, stripAgentTags, buildAgentRetryHint } = require('../utils/agent-turn.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
@@ -396,6 +396,44 @@ const buildMissingToolRetryHint = () => [
 ].join(' ');
 
 /**
+ * 把解析器的错误列表压成一行可读的诊断串。
+ * @param {Array<Object>} errors - parser/native accumulator 的 getErrors()
+ * @returns {string} 形如 `unknown_tool: Bash, Read; invalid_json ×2`
+ */
+const describeToolErrors = (errors) => {
+  const unknown = [...new Set(
+    errors.filter(e => e?.type === 'unknown_tool').map(e => e.name).filter(Boolean)
+  )];
+  const parts = [];
+  if (unknown.length) parts.push(`unknown_tool: ${unknown.join(', ')}`);
+  for (const type of ['invalid_json', 'truncated_tool_call']) {
+    const count = errors.filter(e => e?.type === type).length;
+    if (count) parts.push(`${type} ×${count}`);
+  }
+  return parts.join('; ') || 'unspecified';
+};
+
+/**
+ * 工具错误的重试提示。基础文本复用 agent-turn.js 的通用提示；当错误是编造的工具名时，
+ * 补上真实的名字 —— 那是让这类错误可恢复的唯一信息。
+ * @param {Array<Object>} errors - 本轮的工具错误
+ * @param {Array<string>} allowedToolNames - 本次请求真正提供的工具名
+ * @returns {string} 提示文本
+ */
+const buildToolErrorRetryHint = (errors, allowedToolNames) => {
+  const base = buildAgentRetryHint('invalid_tool_call');
+  const unknown = [...new Set(
+    errors.filter(e => e?.type === 'unknown_tool').map(e => e.name).filter(Boolean)
+  )];
+  if (!unknown.length || !allowedToolNames?.length) return base;
+  return [
+    base,
+    `The tool name(s) ${unknown.join(', ')} do not exist.`,
+    `Use ONLY these exact tool names: ${allowedToolNames.join(', ')}.`
+  ].join('\n');
+};
+
+/**
  * 异步迭代上游 axios 流，按 SSE 段切分回调内部 delta JSON
  * @param {object} upstream - axios stream 响应
  * @param {(json: Object) => Promise<void>|void} onDelta - 单个 delta 回调
@@ -530,13 +568,28 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let upstreamEventCount = 0;
   let visibleText = '';
 
-  const parser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null;
-  // buildToolSystemPrompt 让模型把最终答复包进 <agent_final>...</agent_final>，
-  // 但本控制器没有 Agent 回合门禁去解包，标签会原样发给客户端。剥掉它们。
-  const agentTagStripper = createAgentTagStripper();
-  const nativeToolAccumulator = hasTools
-    ? createNativeToolCallAccumulator({ allowedToolNames })
-    : null;
+  // 每个 attempt 都必须拿到全新的解析器。旧代码只建一次，于是补偿重试会继承上一轮的
+  // 错误列表（hasParseError 永远为真，即使重试本身成功），而一个被截断的 <tool_call>
+  // 还会让 inToolCall 保持打开，把下一轮的正文灌进上一轮的缓冲区。
+  // OpenAI 路径正是为此每轮新建（openai-agent-runtime.js 顶部注释）。
+  let parser = null;
+  let nativeToolAccumulator = null;
+  let agentTagStripper = null;
+  let normalizeDelta = null;
+  let acceptUpstreamFrame = null;
+
+  const startAttempt = () => {
+    parser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null;
+    nativeToolAccumulator = hasTools
+      ? createNativeToolCallAccumulator({ allowedToolNames })
+      : null;
+    // buildToolSystemPrompt 让模型把最终答复包进 <agent_final>...</agent_final>，
+    // 但本控制器没有 Agent 回合门禁去解包，标签会原样发给客户端。剥掉它们。
+    agentTagStripper = createAgentTagStripper();
+    normalizeDelta = createUpstreamDeltaNormalizer();
+    acceptUpstreamFrame = createUpstreamResponseFilter();
+    upstreamFinishReason = null;
+  };
 
   /**
    * 关闭当前打开的文本块
@@ -639,8 +692,6 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let completionContent = '';
   let webSearchInfo = null;
   let thinkingStarted = false;
-  const normalizeDelta = createUpstreamDeltaNormalizer();
-  const acceptUpstreamFrame = createUpstreamResponseFilter();
 
   /**
    * 处理一个上游 delta JSON
@@ -697,94 +748,137 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     }
   };
 
-  let initialStreamResult;
-  try {
-    initialStreamResult = await runWithAnthropicPing(
-      res,
-      () => consumeUpstream(upstream, onUpstreamDelta)
-    );
-  } catch (e) {
-    logger.error('Anthropic 流式心跳包装失败', 'ANTHROPIC', '', e);
-    throw e;
-  }
-  upstreamCompleted = initialStreamResult.completed;
-  upstreamEventCount = initialStreamResult.eventCount;
+  const terminalFinish = () =>
+    ['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
 
-  // required 与”只有思考、没有正文/工具调用”共用一次 Agent 补偿重试。
-  const needsRequiredRetry = !!(
-    parser && !parser.hasEmittedAnyCall() &&
-    !nativeToolAccumulator?.hasAny() && requiresToolCall(toolChoice)
-  );
-  const needsEmptyOutputRetry = !!(
-    !visibleText.trim() && !parser?.hasEmittedAnyCall() && !parser?.hasPendingCall() &&
-    !parser?.hasParseError() && !nativeToolAccumulator?.hasAny() &&
-    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
-  );
-  const needsMissingToolRetry = !!(
-    hasTools && looksLikeUnexecutedToolAction(visibleText) &&
-    !parser?.hasEmittedAnyCall() && !parser?.hasPendingCall() && !parser?.hasParseError() &&
-    !nativeToolAccumulator?.hasAny() &&
-    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
-  );
-  if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
-    const retryBody = appendRetryHint(
-      requestBody,
-      needsRequiredRetry
-        ? buildRetryHint(toolChoice)
-        : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
-    );
+  const currentToolErrors = () => [
+    ...(parser?.getErrors() || []),
+    ...(nativeToolAccumulator?.getErrors() || [])
+  ];
+
+  /**
+   * 判断本轮是否需要重试；返回 null 表示接受本轮。
+   * 只在 flush 之后调用：flush 会结算挂起的工具调用，此后 hasPendingCall() 恒为假。
+   */
+  const decideRetryReason = (emittedCalls) => {
+    if (emittedCalls) return null;
+    if (parser && requiresToolCall(toolChoice)) return 'required';
+    // 以前任何一个工具错误都会让全部补偿失效并直接 502。可是被编造的工具名恰恰是
+    // 最容易纠正的错误：把允许的名字摆在模型面前即可。
+    if (currentToolErrors().length > 0) return 'tool_error';
+    if (hasTools && looksLikeUnexecutedToolAction(visibleText) && !terminalFinish()) {
+      return 'missing_tool';
+    }
+    if (!visibleText.trim() && !terminalFinish()) return 'empty';
+    return null;
+  };
+
+  const retryHintFor = (reason) => {
+    if (reason === 'required') return buildRetryHint(toolChoice);
+    if (reason === 'missing_tool') return buildMissingToolRetryHint();
+    if (reason === 'empty') return buildEmptyOutputRetryHint();
+    return buildToolErrorRetryHint(currentToolErrors(), allowedToolNames);
+  };
+
+  const config = require('../config/index.js');
+  const maxAttempts = Math.max(1, Number(config.agentTurnMaxAttempts) || 1);
+
+  let currentUpstream = upstream;
+  let attemptsMade = 0;
+  let retriedAfterVisibleText = false;
+  let nativeToolCalls = [];
+  let hasEmittedToolCalls = false;
+
+  for (;;) {
+    attemptsMade += 1;
+    startAttempt();
+
+    try {
+      const result = await runWithAnthropicPing(
+        res,
+        () => consumeUpstream(currentUpstream, onUpstreamDelta)
+      );
+      upstreamCompleted = result.completed;
+      upstreamEventCount = result.eventCount;
+    } catch (e) {
+      logger.error('Anthropic 流式心跳包装失败', 'ANTHROPIC', '', e);
+      throw e;
+    }
+
+    // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。
+    if (parser) {
+      const tail = parser.flush();
+      if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
+      for (const call of tail.completedCalls) emitToolUse(call);
+    }
+    // 缓冲区里可能压着一个最终没能凑成标签的前缀，它是正文，必须放出来。
+    emitTextDelta(agentTagStripper.flush());
+
+    nativeToolCalls = nativeToolAccumulator?.hasAny()
+      ? nativeToolAccumulator.finalize()
+      : [];
+    for (const call of nativeToolCalls) emitToolUse(call);
+    hasEmittedToolCalls = !!(nativeToolCalls.length > 0 || parser?.hasEmittedAnyCall());
+
+    const retryReason = decideRetryReason(hasEmittedToolCalls);
+    if (!retryReason || attemptsMade >= maxAttempts) break;
+
+    // 本控制器是边收边发的：正文一产生就写进客户端的流（OpenAI 路径把裸正文扣在门禁
+    // 内，所以它可以随便重试）。因此一旦写过正文，再重试就会把两段输出拼在一起。
+    //
+    // 已经写过正文时只允许一次补偿 —— 这正是改动之前的行为，required 和 missing_tool
+    // 都依赖它。还没写过正文时才放开到 maxAttempts，而上报的故障恰好是这种形状：
+    // 一轮纯 <tool_call> 且工具名无效不产生任何可见正文，所以 6 次尝试都够得着。
+    if (visibleText.trim()) {
+      if (retriedAfterVisibleText) break;
+      retriedAfterVisibleText = true;
+    }
+
     logger.warning?.(
-      needsRequiredRetry
-        ? 'Anthropic 流式: tool_choice=required 首次未触发，重试一次'
-        : (needsMissingToolRetry
-          ? 'Anthropic Agent 首次响应只描述了动作但未调用工具，补偿重试一次'
-          : 'Anthropic Agent 首次响应没有正文或工具调用，补偿重试一次'),
+      `Anthropic Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${retryReason})`,
       'ANTHROPIC'
     );
+
+    let retryResp = null;
     try {
       await runWithAnthropicPing(res, async () => {
-        const retryResp = await sendRequest(retryBody);
-        if (retryResp.status && retryResp.response) {
-          upstreamFinishReason = null;
-          const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
-          upstreamCompleted = retryResult.completed;
-          upstreamEventCount = retryResult.eventCount;
-        }
+        retryResp = await sendRequest(appendRetryHint(requestBody, retryHintFor(retryReason)));
       });
     } catch (e) {
       logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
+      break;
     }
+    if (!retryResp?.status || !retryResp.response) break;
+    currentUpstream = retryResp.response;
   }
 
-  if (parser) {
-    const tail = parser.flush();
-    if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
-    for (const call of tail.completedCalls) emitToolUse(call);
-  }
-  // 缓冲区里可能压着一个最终没能凑成标签的前缀，它是正文，必须放出来。
-  emitTextDelta(agentTagStripper.flush());
-
-  const nativeToolCalls = nativeToolAccumulator?.hasAny()
-    ? nativeToolAccumulator.finalize()
-    : [];
-  for (const call of nativeToolCalls) emitToolUse(call);
-
-  const hasEmittedToolCalls = !!(
-    nativeToolCalls.length > 0 ||
-    (parser && parser.hasEmittedAnyCall())
-  );
+  const finalToolErrors = currentToolErrors();
   const hasToolProtocolError = !!(
     !hasEmittedToolCalls &&
-    (requiresToolCall(toolChoice) ||
-      (parser && parser.hasParseError()) ||
-      (nativeToolAccumulator && nativeToolAccumulator.hasParseError()))
+    (requiresToolCall(toolChoice) || finalToolErrors.length > 0)
   );
 
   if (hasToolProtocolError) {
+    // 这个细节以前存在于 getErrors() 里却被丢掉，于是三种截然不同的原因
+    // （非法 JSON / 未知工具名 / 被截断）挤进同一句不透明的报错，而 unknown_tool
+    // 连一行日志都不留。诊断只能靠读源码。
+    const detail = finalToolErrors.length
+      ? describeToolErrors(finalToolErrors)
+      : 'tool_choice=required 未触发任何工具调用';
+    logger.warning?.(
+      `Anthropic Agent 工具协议失败，${attemptsMade}/${maxAttempts} 次尝试后放弃 (${detail})`,
+      'ANTHROPIC'
+    );
     closeThinkingBlockIfOpen();
     closeTextBlockIfOpen();
-    writeAnthropicError(res, '上游返回了残缺、非法或不存在的工具调用', 'invalid_tool_call_error');
+    writeAnthropicError(
+      res,
+      attemptsMade > 1
+        ? `上游连续 ${attemptsMade} 次返回了残缺、非法或不存在的工具调用 (${detail})`
+        : `上游返回了残缺、非法或不存在的工具调用 (${detail})`,
+      'invalid_tool_call_error'
+    );
     return;
   }
 
@@ -935,64 +1029,102 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
 
-  // required 与空可见输出共用一次 Agent 补偿重试。
-  const needsRequiredRetry = hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice);
-  const needsEmptyOutputRetry = toolCalls.length === 0 && toolErrors.length === 0 && !cleanedText.trim() &&
-    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
-  const needsMissingToolRetry = hasTools && toolCalls.length === 0 && toolErrors.length === 0 &&
-    looksLikeUnexecutedToolAction(cleanedText) &&
-    !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
-  if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
+  // 非流式没有"已经写到线上"的问题：什么都还没发出去，所以每一轮都可以重试。
+  const terminalFinish = () =>
+    ['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
+
+  const decideRetryReason = () => {
+    if (toolCalls.length > 0) return null;
+    if (hasTools && requiresToolCall(toolChoice)) return 'required';
+    // 以前任何一个工具错误都会让全部补偿失效并直接 502。被编造的工具名恰恰是最容易
+    // 纠正的错误：把允许的名字摆在模型面前即可。
+    if (toolErrors.length > 0) return 'tool_error';
+    if (hasTools && looksLikeUnexecutedToolAction(cleanedText) && !terminalFinish()) {
+      return 'missing_tool';
+    }
+    if (!cleanedText.trim() && !terminalFinish()) return 'empty';
+    return null;
+  };
+
+  const config = require('../config/index.js');
+  const maxAttempts = Math.max(1, Number(config.agentTurnMaxAttempts) || 1);
+  let attemptsMade = 1;
+  let streamBrokeOnRetry = false;
+
+  while (attemptsMade < maxAttempts) {
+    const retryReason = decideRetryReason();
+    if (!retryReason) break;
+
     logger.warning?.(
-      needsRequiredRetry
-        ? 'Anthropic 非流式: tool_choice=required 首次未触发，重试一次'
-        : (needsMissingToolRetry
-          ? 'Anthropic Agent 首次响应只描述了动作但未调用工具，补偿重试一次'
-          : 'Anthropic Agent 首次响应没有正文或工具调用，补偿重试一次'),
+      `Anthropic 非流式 Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${retryReason})`,
       'ANTHROPIC'
     );
+
+    const hint = retryReason === 'required'
+      ? buildRetryHint(toolChoice)
+      : (retryReason === 'missing_tool'
+        ? buildMissingToolRetryHint()
+        : (retryReason === 'empty'
+          ? buildEmptyOutputRetryHint()
+          : buildToolErrorRetryHint(toolErrors, allowedToolNames)));
+
+    let retryResp = null;
     try {
-      const retryResp = await sendRequest(appendRetryHint(
-        requestBody,
-        needsRequiredRetry
-          ? buildRetryHint(toolChoice)
-          : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
-      ));
-      if (retryResp.status && retryResp.response) {
-        const before = answerContent;
-        nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames });
-        upstreamFinishReason = null;
-        const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
-        upstreamCompleted = retryResult.completed;
-        upstreamEventCount = retryResult.eventCount;
-        if (!upstreamCompleted && !upstreamFinishReason) {
-          return res.status(502).json({
-            type: 'error',
-            error: { type: 'api_error', message: '工具调用重试流在结束标记前断开' }
-          });
-        }
-        const retried = answerContent.slice(before.length);
-        const parsedRetry = parseToolCallsFromText(retried, { allowedToolNames });
-        nativeToolCalls = nativeToolAccumulator.hasAny()
-          ? nativeToolAccumulator.finalize()
-          : [];
-        toolCalls = [...nativeToolCalls, ...parsedRetry.toolCalls]
-          .map((call, index) => ({ ...call, index }));
-        cleanedText = stripAgentTags(parsedRetry.cleanedText);
-        toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
-      }
+      retryResp = await sendRequest(appendRetryHint(requestBody, hint));
     } catch (e) {
       logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
+      break;
     }
+    if (!retryResp?.status || !retryResp.response) break;
+
+    attemptsMade += 1;
+    const before = answerContent;
+    // 每轮全新的累加器，否则上一轮的错误会一直跟着走。
+    nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames });
+    upstreamFinishReason = null;
+    const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
+    upstreamCompleted = retryResult.completed;
+    upstreamEventCount = retryResult.eventCount;
+    if (!upstreamCompleted && !upstreamFinishReason) {
+      streamBrokeOnRetry = true;
+      break;
+    }
+    const retried = answerContent.slice(before.length);
+    const parsedRetry = parseToolCallsFromText(retried, { allowedToolNames });
+    nativeToolCalls = nativeToolAccumulator.hasAny()
+      ? nativeToolAccumulator.finalize()
+      : [];
+    toolCalls = [...nativeToolCalls, ...parsedRetry.toolCalls]
+      .map((call, index) => ({ ...call, index }));
+    cleanedText = stripAgentTags(parsedRetry.cleanedText);
+    toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
+  }
+
+  if (streamBrokeOnRetry) {
+    return res.status(502).json({
+      type: 'error',
+      error: { type: 'api_error', message: '工具调用重试流在结束标记前断开' }
+    });
   }
 
   if (hasTools && toolCalls.length === 0 && (toolErrors.length > 0 || requiresToolCall(toolChoice))) {
+    // 这个细节以前存在于 errors 里却被丢掉，于是三种截然不同的原因挤进同一句
+    // 不透明的报错，而 unknown_tool 连一行日志都不留。
+    const detail = toolErrors.length
+      ? describeToolErrors(toolErrors)
+      : 'tool_choice=required 未触发任何工具调用';
+    logger.warning?.(
+      `Anthropic 非流式工具协议失败，${attemptsMade}/${maxAttempts} 次尝试后放弃 (${detail})`,
+      'ANTHROPIC'
+    );
     return res.status(502).json({
       type: 'error',
       error: {
         type: 'invalid_tool_call_error',
-        message: '上游返回了残缺、非法或不存在的工具调用'
+        message: attemptsMade > 1
+          ? `上游连续 ${attemptsMade} 次返回了残缺、非法或不存在的工具调用 (${detail})`
+          : `上游返回了残缺、非法或不存在的工具调用 (${detail})`
       }
     });
   }

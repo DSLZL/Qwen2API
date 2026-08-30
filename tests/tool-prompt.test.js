@@ -92,3 +92,81 @@ test('native tool accumulator rebuilds fragmented OpenAI tool deltas', () => {
   assert.equal(calls[0].function.arguments, '{"path":"a"}')
   assert.equal(accumulator.hasParseError(), false)
 })
+
+// 模型不总是照抄标签。这些变体以前都不匹配字面量，于是整段 XML 作为正文泄漏，
+// 而且不记录任何错误 —— 既不 502 也不重试，调用方只看到裸 XML。
+const TAG_VARIANTS = [
+  ['大写', '<TOOL_CALL>{"name":"read_file","arguments":{}}</TOOL_CALL>'],
+  ['标签内空白', '<tool_call >{"name":"read_file","arguments":{}}< /tool_call >'],
+  ['复数', '<tool_calls>{"name":"read_file","arguments":{}}</tool_calls>'],
+  ['混合大小写', '<Tool_Call>{"name":"read_file","arguments":{}}</Tool_call>']
+]
+
+test('tolerant tags: whole-text parser accepts case, spacing and plural variants', () => {
+  for (const [label, text] of TAG_VARIANTS) {
+    const result = parseToolCallsFromText(text, { allowedToolNames: ['read_file'] })
+    assert.equal(result.toolCalls.length, 1, `${label}: 未识别为工具调用`)
+    assert.equal(result.toolCalls[0].function.name, 'read_file', label)
+    assert.equal(result.errors.length, 0, label)
+    assert.equal(result.cleanedText, '', `${label}: XML 泄漏进了正文`)
+  }
+})
+
+test('tolerant tags: stream parser accepts the same variants, split byte by byte', () => {
+  for (const [label, text] of TAG_VARIANTS) {
+    const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+    let visible = ''
+    const calls = []
+    for (const ch of text) {
+      const out = parser.push(ch)
+      visible += out.textDelta
+      calls.push(...out.completedCalls)
+    }
+    const tail = parser.flush()
+    visible += tail.textDelta
+    calls.push(...tail.completedCalls)
+
+    assert.equal(calls.length, 1, `${label}: 未识别为工具调用`)
+    assert.equal(calls[0].function.name, 'read_file', label)
+    assert.equal(visible, '', `${label}: XML 泄漏进了正文`)
+    assert.equal(parser.hasParseError(), false, label)
+  }
+})
+
+test('tolerant tags: ordinary prose with angle brackets still streams through', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  const text = 'use <div>, and 1 < 2 < 3, and <toolbox> too'
+  let visible = ''
+  for (const ch of text) visible += parser.push(ch).textDelta
+  visible += parser.flush().textDelta
+  assert.equal(visible, text)
+  assert.equal(parser.hasParseError(), false)
+})
+
+test('tolerant tags: a lone "<" is released by flush, not swallowed', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: [] })
+  // '<tool_ca' 是一个真标签的前缀，必须留在缓冲区等待后续 chunk……
+  assert.equal(parser.push('cost <tool_ca').textDelta, 'cost ')
+  // ……但流到此为止，flush 必须把它当正文放出来。
+  assert.equal(parser.flush().textDelta, '<tool_ca')
+})
+
+test('tolerant tags: the tag-shaped buffer stays bounded on long text', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: [] })
+  const text = `${'x'.repeat(4000)}<${'y'.repeat(4000)}`
+  const out = parser.push(text)
+  // 只有末尾一个标签长度以内的片段可以被扣住。
+  assert.ok(text.length - out.textDelta.length <= 24, '缓冲区超过了一个标签的长度')
+  assert.equal(out.textDelta + parser.flush().textDelta, text)
+})
+
+test('tolerant tags: history is still written in the canonical form', () => {
+  const folded = foldToolMessages([
+    {
+      role: 'assistant',
+      tool_calls: [{ id: 'c1', function: { name: 'read_file', arguments: '{"path":"a"}' } }]
+    }
+  ])
+  assert.match(folded[0].content, /<tool_call>/)
+  assert.doesNotMatch(folded[0].content, /<tool_calls>/i)
+})
