@@ -77,7 +77,14 @@ const config = {
     ),
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
-    antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false'
+    antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
+    // Anthropic SSE `ping` cadence during upstream silence. Lower it if a client
+    // or reverse proxy gives up sooner than this; the compensation retry can hold
+    // the stream for tens of seconds with nothing else to send.
+    anthropicPingIntervalMs: Math.max(
+        1000,
+        parseInt(process.env.ANTHROPIC_PING_INTERVAL_MS, 10) || 15000
+    )
 }
 
 module.exports = config

@@ -12,6 +12,19 @@ const { validateApiKey } = require('../src/middlewares/authorization.js');
 
 // Test buildInternalRequest envelope structure
 const anthropicController = require('../src/controllers/anthropic.js');
+const { runWithAnthropicPing } = anthropicController;
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const createMockResponse = () => ({
+  output: '',
+  writableEnded: false,
+  destroyed: false,
+  write(chunk) {
+    this.output += String(chunk);
+    return true;
+  }
+});
 
 describe('Claude Code Compatibility', () => {
   describe('Model Pass-Through', () => {
@@ -118,3 +131,44 @@ describe('Claude Code Compatibility', () => {
     });
   });
 });
+
+describe('SSE keepalive during upstream silence', () => {
+  it('emits protocol ping events, never SSE comments', async () => {
+    const res = createMockResponse()
+    await runWithAnthropicPing(res, () => delay(70), 20)
+
+    // The bug this guards: a `: keepalive` comment puts bytes on the socket, so a
+    // reverse proxy stays happy and the measurement looks fine, but every SDK drops
+    // lines beginning with `:` while reading the stream -- the client still sees a
+    // dead connection. Only an in-protocol event reaches it.
+    assert.doesNotMatch(res.output, /^:/m)
+    const pings = res.output.match(/event: ping\n/g) || []
+    assert.ok(pings.length >= 2, `expected >= 2 pings, got ${pings.length}`)
+    assert.match(res.output, /event: ping\ndata: \{"type":"ping"\}/)
+  })
+
+  it('stops pinging once the wrapped work settles', async () => {
+    const res = createMockResponse()
+    await runWithAnthropicPing(res, () => delay(50), 20)
+    const afterWork = (res.output.match(/event: ping\n/g) || []).length
+    await delay(80)
+    const afterIdle = (res.output.match(/event: ping\n/g) || []).length
+    assert.equal(afterIdle, afterWork, 'interval outlived the work it was covering')
+  })
+
+  it('returns the wrapped value and propagates rejection', async () => {
+    const res = createMockResponse()
+    assert.equal(await runWithAnthropicPing(res, async () => 'done', 20), 'done')
+    await assert.rejects(
+      () => runWithAnthropicPing(res, async () => { throw new Error('upstream died') }, 20),
+      /upstream died/
+    )
+  })
+
+  it('writes nothing after the response has ended', async () => {
+    const res = createMockResponse()
+    res.writableEnded = true
+    await runWithAnthropicPing(res, () => delay(70), 20)
+    assert.equal(res.output, '')
+  })
+})

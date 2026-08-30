@@ -3,7 +3,6 @@ const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
 const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js');
-const { runWithSSEHeartbeat } = require('./chat.js');
 const {
   buildToolSystemPrompt,
   foldToolMessages,
@@ -434,6 +433,43 @@ const writeAnthropicEvent = (res, event, data) => {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 };
 
+// SSE 保活间隔。上游长时间静默的两个来源：首轮 thinking，以及门禁拒绝后的补偿重试
+// —— 后者要整段重新生成，客户端在此期间看不到任何内容。
+// 延迟读取：本文件没有在模块作用域引入 config，顶层读取会在加载时抛错。
+const pingIntervalMs = () => require('../config/index.js').anthropicPingIntervalMs;
+
+/**
+ * 在 work 执行期间按间隔发送 Anthropic `ping` 事件，避免客户端把流判为卡死。
+ *
+ * 必须用协议内的 `ping` 事件，不能用 SSE 注释（`: keepalive`）：注释的字节能重置
+ * 反向代理的空闲计时器，但 SDK 会在读取行时直接丢弃以 `:` 开头的行，客户端因此
+ * 什么都收不到。ccproxy 网桥当初正是靠改发真正的 ping 事件才消除同样的假死。
+ *
+ * 只能在 message_start 之后调用——此时响应头已提交，ping 是合法的流内事件。
+ * @param {object} res - Express 响应
+ * @param {Function} work - 被包裹的异步任务
+ * @param {number} [intervalMs] - 发送间隔，缺省取 config.anthropicPingIntervalMs
+ * @returns {Promise<*>} work 的返回值
+ */
+const runWithAnthropicPing = async (res, work, intervalMs) => {
+  const everyMs = Math.max(1, Number(intervalMs) || pingIntervalMs());
+  const timer = setInterval(() => {
+    if (res.writableEnded || res.destroyed) return;
+    try {
+      writeAnthropicEvent(res, 'ping', { type: 'ping' });
+      if (typeof res.flush === 'function') res.flush();
+    } catch (_) {
+      // 客户端断开由后续流消费/写入路径统一收敛。
+    }
+  }, everyMs);
+  timer.unref?.();
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+  }
+};
+
 /**
  * 处理流式 Anthropic 响应
  * @param {object} res - Express 响应
@@ -659,10 +695,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 
   let initialStreamResult;
   try {
-    initialStreamResult = await runWithSSEHeartbeat(
+    initialStreamResult = await runWithAnthropicPing(
       res,
-      () => consumeUpstream(upstream, onUpstreamDelta),
-      15000
+      () => consumeUpstream(upstream, onUpstreamDelta)
     );
   } catch (e) {
     logger.error('Anthropic 流式心跳包装失败', 'ANTHROPIC', '', e);
@@ -703,13 +738,15 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       'ANTHROPIC'
     );
     try {
-      const retryResp = await sendRequest(retryBody);
-      if (retryResp.status && retryResp.response) {
-        upstreamFinishReason = null;
-        const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
-        upstreamCompleted = retryResult.completed;
-        upstreamEventCount = retryResult.eventCount;
-      }
+      await runWithAnthropicPing(res, async () => {
+        const retryResp = await sendRequest(retryBody);
+        if (retryResp.status && retryResp.response) {
+          upstreamFinishReason = null;
+          const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
+          upstreamCompleted = retryResult.completed;
+          upstreamEventCount = retryResult.eventCount;
+        }
+      });
     } catch (e) {
       logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
@@ -1096,6 +1133,7 @@ module.exports = {
   normalizeAnthropicSystem,
   mapAnthropicStopReason,
   consumeUpstream,
+  runWithAnthropicPing,
   handleAnthropicStream,
   handleAnthropicNonStream
 };
