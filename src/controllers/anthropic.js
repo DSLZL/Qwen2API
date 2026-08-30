@@ -11,7 +11,8 @@ const {
   createNativeToolCallAccumulator,
   looksLikeUnexecutedToolAction
 } = require('../utils/tool-prompt.js');
-const { createAgentTagStripper, stripAgentTags, buildAgentRetryHint } = require('../utils/agent-turn.js');
+const { createAgentTagStripper, stripAgentTags, buildAgentRetryHint, buildAgentTurnDirective } = require('../utils/agent-turn.js');
+const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
@@ -219,13 +220,18 @@ const buildInternalRequest = async (anthropicReq) => {
   const normalizedTools = normalizeAnthropicTools(tools);
   const internalToolChoice = normalizeAnthropicToolChoice(tool_choice);
 
+  // 0. Detect afterToolResult from original messages before flattening
+  const originalLast = Array.isArray(messages) ? messages[messages.length - 1] : null;
+  const afterToolResult = originalLast?.role === 'user' && Array.isArray(originalLast?.content) && originalLast.content.some(b => b?.type === 'tool_result');
+
   // 1. 展开 Anthropic 消息（tool_use/tool_result 折叠由 foldToolMessages 完成）
   let flat = flattenAnthropicMessages(messages);
   const systemText = normalizeAnthropicSystem(system);
 
   // 2. system 文本拼到首条用户消息内容前缀（不要作为独立 system 消息，
   //    否则会被 parserMessages 折叠为 "system:..." 文字前缀污染模型理解）
-  const hasTools = normalizedTools.length > 0;
+  // ponytail: gate on tool_choice !== 'none' to match OpenAI path (chat-middleware.js:7-12)
+  const hasTools = normalizedTools.length > 0 && internalToolChoice !== 'none';
   const toolPrompt = hasTools ? buildToolSystemPrompt(normalizedTools, { tool_choice: internalToolChoice }) : '';
 
   if (hasTools) {
@@ -257,6 +263,26 @@ const buildInternalRequest = async (anthropicReq) => {
           chat_type: 't2t',
           feature_config: { output_schema: 'phase', thinking_enabled: false }
         });
+      }
+    }
+  }
+
+  // 5. Agent-loop injections (match OpenAI path ordering: envelope → prefix → directive)
+  if (hasTools && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
+    const last = parsedMessages[parsedMessages.length - 1];
+    const role = last.role || 'user';
+    // Wrap content with # Current message marker so upstream distinguishes turn from history
+    last.content = ensureAgentCurrentEnvelope(last.content, role);
+    // Append agent-turn directive after full content assembly
+    const directive = buildAgentTurnDirective({ afterToolResult });
+    if (typeof last.content === 'string') {
+      last.content = `${last.content}\n\n${directive}`;
+    } else if (Array.isArray(last.content)) {
+      const textIdx = last.content.findIndex(c => c && c.type === 'text');
+      if (textIdx >= 0) {
+        last.content[textIdx].text = `${last.content[textIdx].text || ''}\n\n${directive}`;
+      } else {
+        last.content.push({ type: 'text', text: directive });
       }
     }
   }
