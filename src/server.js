@@ -52,6 +52,18 @@ const csrfProtect = (req, res, next) => {
   const secret = req.headers['x-csrf-secret']
   const token = req.headers['x-csrf-token']
   if (secret && token && csrfTokens.verify(secret, token)) return next()
+  // Anthropic-compatible error schema for Claude Code clients.
+  // Match authorization.js heuristic: x-api-key header or /v1/messages path.
+  // Accept header not required (curl tests and some SDK versions omit it).
+  const isAnthropicClient = !!(
+    req.headers['x-api-key'] || req.path?.startsWith('/v1/messages')
+  )
+  if (isAnthropicClient) {
+    return res.status(403).json({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'Invalid CSRF token' }
+    })
+  }
   return res.status(403).json({ error: 'Invalid CSRF token' })
 }
 app.use(csrfProtect)

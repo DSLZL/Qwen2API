@@ -12,7 +12,6 @@ const PARTIAL_FIELDS = new Set([
 ]);
 
 const IGNORED_WITH_WARNING_FIELDS = new Set([
-  'max_tokens',
   'stop_sequences',
   'metadata',
   'temperature',

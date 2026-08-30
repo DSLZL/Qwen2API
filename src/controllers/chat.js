@@ -1375,5 +1375,6 @@ module.exports = {
     handleStreamResponse,
     handleNonStreamResponse,
     setResponseHeaders,
-    normalizeOpenAIFinishReason
+    normalizeOpenAIFinishReason,
+    runWithSSEHeartbeat
 }

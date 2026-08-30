@@ -3,6 +3,7 @@ const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
 const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js');
+const { runWithSSEHeartbeat } = require('./chat.js');
 const {
   buildToolSystemPrompt,
   foldToolMessages,
@@ -260,17 +261,66 @@ const buildInternalRequest = async (anthropicReq) => {
     }
   }
 
+  // Align with React UI envelope format (chat-middleware.js lines 63-100)
+  // to avoid WAF/captcha rejection (FAIL_SYS_USER_VALIDATE).
+  const now = Math.floor(Date.now() / 1000);
+  const fid = generateUUID();
+  const lastParsed = Array.isArray(parsedMessages) && parsedMessages.length > 0
+    ? parsedMessages[parsedMessages.length - 1]
+    : { role: 'user', content: '' };
+
+  const envelopeMessage = {
+    id: null,
+    fid: fid,
+    parentId: null,
+    parent_id: null,
+    childrenIds: [generateUUID()],
+    role: lastParsed.role || 'user',
+    content: lastParsed.content || '',
+    user_action: 'chat',
+    files: [],
+    timestamp: now,
+    models: [parsedModel],
+    model: '',
+    chat_type: chatType,
+    feature_config: {
+      output_schema: 'phase',
+      thinking_enabled: thinkingCfg.thinking_enabled,
+      research_mode: 'normal',
+      auto_thinking: true,
+      thinking_mode: 'Auto',
+      thinking_format: 'summary',
+      auto_search: true
+    },
+    extra: { meta: { subChatType: chatType } },
+    sub_chat_type: chatType
+  };
+
   const body = {
     stream: !!stream,
+    version: '2.1',
     incremental_output: true,
-    chat_type: chatType,
-    sub_chat_type: chatType,
+    chat_id: null,
+    chatId: null,
     chat_mode: 'normal',
     model: parsedModel,
-    messages: parsedMessages,
+    parent_id: null,
+    parentId: null,
+    messages: [envelopeMessage],
+    timestamp: now,
+    chat_type: chatType,
+    sub_chat_type: chatType,
     session_id: generateUUID(),
     id: generateUUID()
   };
+
+  // Pass max_tokens to upstream if provided (guard against NaN/Infinity)
+  if (anthropicReq.max_tokens != null) {
+    const mt = Number(anthropicReq.max_tokens);
+    if (Number.isFinite(mt) && mt > 0) {
+      body.max_tokens = mt;
+    }
+  }
 
   return {
     body,
@@ -408,6 +458,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     'Connection': 'keep-alive'
   });
 
+  const createdAt = new Date().toISOString();
+
   // message_start
   writeAnthropicEvent(res, 'message_start', {
     type: 'message_start',
@@ -419,7 +471,14 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 }
+      created_at: createdAt,
+      metadata: {},
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null
+      }
     }
   });
 
@@ -598,11 +657,21 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     }
   };
 
-  const initialStreamResult = await consumeUpstream(upstream, onUpstreamDelta);
+  let initialStreamResult;
+  try {
+    initialStreamResult = await runWithSSEHeartbeat(
+      res,
+      () => consumeUpstream(upstream, onUpstreamDelta),
+      15000
+    );
+  } catch (e) {
+    logger.error('Anthropic 流式心跳包装失败', 'ANTHROPIC', '', e);
+    throw e;
+  }
   upstreamCompleted = initialStreamResult.completed;
   upstreamEventCount = initialStreamResult.eventCount;
 
-  // required 与“只有思考、没有正文/工具调用”共用一次 Agent 补偿重试。
+  // required 与”只有思考、没有正文/工具调用”共用一次 Agent 补偿重试。
   const needsRequiredRetry = !!(
     parser && !parser.hasEmittedAnyCall() &&
     !nativeToolAccumulator?.hasAny() && requiresToolCall(toolChoice)
@@ -710,7 +779,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   writeAnthropicEvent(res, 'message_delta', {
     type: 'message_delta',
     delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { input_tokens: promptTokens, output_tokens: completionTokens }
+    usage: {
+      input_tokens: promptTokens,
+      output_tokens: completionTokens,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null
+    }
   });
   writeAnthropicEvent(res, 'message_stop', { type: 'message_stop' });
   res.end();
@@ -931,6 +1005,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   // Daily stats 累计——一次性归属主账户（同 stream 分支注释）
   attributeChatUsage(ctx.currentAccount, promptTokens, completionTokens);
 
+  const createdAt = new Date().toISOString();
   res.set({ 'Content-Type': 'application/json' });
   res.json({
     id: message_id,
@@ -940,7 +1015,14 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     content: contentBlocks,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: { input_tokens: promptTokens, output_tokens: completionTokens }
+    created_at: createdAt,
+    metadata: {},
+    usage: {
+      input_tokens: promptTokens,
+      output_tokens: completionTokens,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null
+    }
   });
 };
 
