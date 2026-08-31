@@ -50,7 +50,8 @@ const imageMarkdownFromDelta = (delta) => {
 const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   const hasTools = options.has_tools !== false
   const allowedToolNames = options.allowed_tool_names || []
-  const normalizeDelta = createUpstreamDeltaNormalizer()
+  // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）。
+  const normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames })
   const acceptUpstreamFrame = createUpstreamResponseFilter()
   const nativeTools = hasTools
     ? createNativeToolCallAccumulator({ allowedToolNames })

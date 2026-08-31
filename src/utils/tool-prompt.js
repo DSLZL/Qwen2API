@@ -125,6 +125,24 @@ const TOOL_CALL_CLOSE_MAX = Math.max(
 const TOOL_CALL_SPAN_MAX = 1024 * 1024;
 
 /**
+ * 「泄漏的调用负载」的形状谓词：开头（允许前导空白）就是一个 JSON 对象，且文本里
+ * 同时出现 "name" 和 "arguments" 两个键。普通 JSON 答案（缺任一键）不会误伤。
+ *
+ * 单一来源：残渣检测（containsOrphanProtocolResidue，决定 malformed_protocol 重试）
+ * 和合成开端（matchToolCallOpening，决定要不要试着抢救成真调用）都消费**这一个**
+ * 谓词。两边一旦各自维护一份，就会出现“检测说是泄漏、抢救说不是”的缝隙 ——
+ * 泄漏永远卡在重试环里。不要复制，不要内联。
+ */
+const LEAKED_PAYLOAD_NAME_RE = /"name"\s*:/;
+const LEAKED_PAYLOAD_ARGS_RE = /"arguments"\s*:/;
+const isLeakedToolPayloadShape = (value) => {
+  const trimmed = String(value || '').trimStart();
+  return trimmed.startsWith('{') &&
+    LEAKED_PAYLOAD_NAME_RE.test(trimmed) &&
+    LEAKED_PAYLOAD_ARGS_RE.test(trimmed);
+};
+
+/**
  * 记录正文当前是否处在代码上下文里。文档里的例子必须保持是例子：``` 围栏内，
  * 或同一行反引号数为奇数（行内代码）时，触发器不算触发器。
  * 增量式：只喂**已经放行**的正文，所以流式和整段两条路径可以共用同一套判断。
@@ -231,6 +249,40 @@ const findPayloadStart = (text, from, canGrow) => {
 };
 
 /**
+ * 找回答里的下一个调用开端。正则触发器优先；找不到时考虑**合成开端**：
+ * 实测泄漏（2026-08-31 10:12–10:17）里模型把开标记整个吞掉，答案直接以
+ * `{"name":…,"arguments":…}` 负载开头再跟 `[END TOOL CALL]` —— 没有触发器可点火，
+ * 整段作为正文流向客户端。合成开端让这种负载重新进入解析管线，由后续闸门
+ * （JSON 配平、强制闭标记、名字白名单）决定它是不是调用。
+ *
+ * 位置门在这里：只有「此前没有任何非空白正文」（emittedProse=false —— 回答开头，
+ * 或紧跟上一个已完成的调用，中间只有空白）且眼前第一个非空白字符是 '{'、整段
+ * 文本满足 isLeakedToolPayloadShape 时才产生合成开端。调用方把代码上下文
+ * （code.inCode()）并进 emittedProse 传入 —— 围栏/行内代码里的负载永远是文档。
+ *
+ * 合成开端按位置优先于更靠后的正则触发器：两条解析路径（整段 / 流式）都是从左
+ * 到右消费，流式在正则触发器抵达之前就已经看见了开头的负载；谁在前谁生效才能
+ * 保证两条路径对同一份文本给出同一个结果。合法的合成开端前面只有空白，正则
+ * 触发器不可能匹配到它前面去，所以这条规则等价于「合成开端存在即生效」。
+ * @param {string} text - 待扫描文本（从当前位置起）
+ * @param {{ emittedProse?: boolean }} [options]
+ * @returns {{ index: number, text: string, synthetic: boolean }|null}
+ */
+const matchToolCallOpening = (text, { emittedProse = false } = {}) => {
+  const match = text.match(TOOL_CALL_TRIGGER_RE);
+  if (!emittedProse) {
+    const braceAt = text.search(/\S/);
+    if (braceAt !== -1 && text[braceAt] === '{' &&
+        (!match || braceAt < match.index) &&
+        isLeakedToolPayloadShape(text)) {
+      return { index: braceAt, text: '', synthetic: true };
+    }
+  }
+  if (match) return { index: match.index, text: match[0], synthetic: false };
+  return null;
+};
+
+/**
  * 负载被 ```json 围栏包起来时，把收尾的那道围栏也吞掉。
  * 只在触发器和负载之间确实出现过围栏时才吞 —— 否则孤零零的收尾围栏会漏进正文，
  * 还会把 createCodeContextTracker 翻转，让这一整条回复后面的触发器全被当成文档。
@@ -280,6 +332,65 @@ const consumeTrailingCloser = (text, from, canGrow) => {
     return { end: index + slice.length, needMore: false };
   }
   return { end: from, needMore: false };
+};
+
+/**
+ * 合成开端的**强制**闭标记：负载配平之后必须紧跟一个方括号闭标记，之间只许空白。
+ *
+ * 这道门是抢救与注入之间的整条边界。裸负载本身在不可信内容里到处都是（一个配置
+ * 文件、一段 README），写侧的 neutraliseResultMarkers 不会去动它 —— 改写负载形状
+ * 会腐蚀结果里流过的合法 JSON。写侧动的是**闭标记**：折叠进历史的结果正文里，
+ * 一切 `[END/／TOOL CALL` 的头字符都被换成 '('。所以「模型从结果里逐字引用回来的
+ * 负载」永远凑不齐这里要求的闭标记，而「模型自己想调用却写坏了协议」的输出带着它。
+ * 闭标记因此必须强制、必须紧邻（邻接规则）、必须是方括号形式 —— 三者都不许放松。
+ *
+ * 邻接规则的判定：配平点之后跳过空白；一旦出现既非空白、又不能开始闭标记（'['）
+ * 的字符，立刻判负（found:false），调用方立即按正文放行。只有尾巴还是纯空白、
+ * 或是一个仍可能长成闭标记的 '[' 前缀（上界 TOOL_CALL_CLOSE_MAX）时才等待更多输入。
+ * @returns {{ end: number, needMore: boolean, found: boolean }}
+ */
+const consumeMandatoryBracketCloser = (text, from, canGrow) => {
+  let index = from;
+  while (index < text.length && /\s/.test(text[index])) index += 1;
+  if (index >= text.length) return { end: from, needMore: !!canGrow, found: false };
+  if (text[index] !== '[') return { end: from, needMore: false, found: false };
+  const slice = text.slice(index, index + TOOL_CALL_CLOSE_MAX);
+  const match = slice.match(TOOL_CALL_CLOSE_BRACKET_RE);
+  if (match) return { end: index + match[0].length, needMore: false, found: true };
+  const viable = !slice.includes(']') && !slice.includes('[', 1);
+  if (canGrow && slice.length < TOOL_CALL_CLOSE_MAX && viable) {
+    return { end: from, needMore: true, found: false };
+  }
+  // 流已结束：光秃秃的 `[END TOOL CALL`（少一个 ']'）后面什么都没有，那它就是闭标记。
+  // 与 consumeTrailingCloser 同一条纪律；写侧的失效替换同样打掉它的头字符。
+  const bare = slice.match(TOOL_CALL_CLOSE_BRACKET_BARE_RE);
+  if (!canGrow && bare && !slice.slice(bare[0].length).trim()) {
+    return { end: index + slice.length, needMore: false, found: true };
+  }
+  return { end: from, needMore: false, found: false };
+};
+
+/**
+ * 任何调用（常规或合成）收尾之后，把**重复**的闭标记一并吞掉：实测泄漏 #2 的模型
+ * 连写两个 `[END TOOL CALL]`，第二个作为孤儿闭标记漏进正文，又点着 malformed_protocol
+ * 的残渣检测。只吞「已经能判定是闭标记」的重复：尾巴是纯空白时立刻停下（绝不等待 ——
+ * 否则每个后面跟换行的调用都要压到 flush 才能发出）；needMore 仅在缓冲里躺着一个
+ * 还没长全的闭标记前缀时为真。
+ * @returns {{ end: number, needMore: boolean }}
+ */
+const consumeDuplicateClosers = (text, from, canGrow) => {
+  let end = from;
+  for (;;) {
+    let probe = end;
+    while (probe < text.length && /\s/.test(text[probe])) probe += 1;
+    if (probe >= text.length) return { end, needMore: false };
+    const head = text[probe];
+    if (head !== '[' && head !== '<') return { end, needMore: false };
+    const dup = consumeTrailingCloser(text, end, canGrow);
+    if (dup.needMore) return { end, needMore: true };
+    if (dup.end === end) return { end, needMore: false };
+    end = dup.end;
+  }
 };
 
 const firstNonEmptyString = (...values) =>
@@ -389,23 +500,24 @@ const looksLikeUnexecutedToolAction = (value) => {
 };
 
 // 协议残渣检测：模型把方括号协议写坏时（孤儿 [END TOOL CALL] 闭标记，或答案
-// 开头直接是 {"name":…,"arguments":…} 负载而没有开触发器），没有触发器可点火，
-// 整段泄漏为可见正文、零调用、零重试 —— 实测 2026-08-31 客户端原样显示了泄漏。
-// 这只是**重试信号**：名字只能来自触发器后面的负载这条边界规则不受影响，
-// 泄漏的 JSON 永远不会被执行。
+// 开头直接是 {"name":…,"arguments":…} 负载而没有开触发器），泄漏为可见正文时
+// 点起 malformed_protocol 重试。负载形状那一半与合成开端共用同一个谓词
+// （isLeakedToolPayloadShape，见其注释）：抢救的闸门放行成调用的，永远不会
+// 再落进这里；被闸门拒绝按正文放行的，正好被这里接住。
 // 闭标记扫描复用上面的有界正则，仅去掉行首锚点以便在整段文本中查找。
 const TOOL_CALL_CLOSE_BRACKET_SCAN_RE = new RegExp(TOOL_CALL_CLOSE_BRACKET_RE.source.replace(/^\^/, ''), 'i');
-const LEAKED_PAYLOAD_NAME_RE = /"name"\s*:/;
-const LEAKED_PAYLOAD_ARGS_RE = /"arguments"\s*:/;
 const containsOrphanProtocolResidue = (value) => {
   const text = String(value || '');
   if (TOOL_CALL_CLOSE_BRACKET_SCAN_RE.test(text)) return true;
-  // 形状收紧到"泄漏的调用负载"：开头就是 JSON 对象且同时带 name 和 arguments
-  // 两个键，普通的 JSON 答案（缺任一键）不会误伤。
-  const trimmed = text.trimStart();
-  return trimmed.startsWith('{') &&
-    LEAKED_PAYLOAD_NAME_RE.test(trimmed) &&
-    LEAKED_PAYLOAD_ARGS_RE.test(trimmed);
+  return isLeakedToolPayloadShape(text);
+};
+
+// 合成开端被闸门拒绝时留痕。与其他工具日志同一条纪律：只登记原因，绝不把负载
+// 内容打进日志（可能携带凭据）。拒绝不是错误（不进 errors）：tool_error 会抢在
+// malformed_protocol 之前把重试断掉，被拒绝的文本必须按正文放行、让残渣检测
+// 照老规矩接手。
+const logSyntheticRejected = (reason) => {
+  warnTool(`裸负载抢救被拒绝（${reason}），按正文放行`);
 };
 
 const createToolCallObject = (payload, index = 0, id = null) => ({
@@ -643,7 +755,10 @@ const sanitizeMarkerName = (value) => String(value || '')
  * @returns {{ cleanedText: string, toolCalls: Array<Object>, errors: Array<Object>, warnings: Array<Object> }}
  */
 const parseToolCallsFromText = (fullText, options = {}) => {
-  if (typeof fullText !== 'string' || !TOOL_CALL_TRIGGER_RE.test(fullText)) {
+  // 快路径必须与识别器同步：正则触发器**或**答案开头的裸负载形状，二者都算
+  // “可能有调用”。只测正则的话，合成开端在这里就被拦掉了。
+  if (typeof fullText !== 'string' ||
+      !(TOOL_CALL_TRIGGER_RE.test(fullText) || isLeakedToolPayloadShape(fullText))) {
     return { cleanedText: fullText || '', toolCalls: [], errors: [], warnings: [] };
   }
 
@@ -672,18 +787,68 @@ const parseToolCallsFromText = (fullText, options = {}) => {
   // 字符串的内容，不是 Markdown 标记，喂进去会让围栏状态永久错位。
   const releaseDebris = (text) => { cleanedText += text; };
 
-  while (position < fullText.length) {
-    const match = fullText.slice(position).match(TOOL_CALL_TRIGGER_RE);
-    if (!match) break;
+  /**
+   * 合成开端（from 指向 '{'）的结算。全部闸门 —— 负载配平、强制闭标记（邻接规则）、
+   * 名字只来自负载且过白名单 —— 通过才成为调用；任何一道不过，整段按**正文**放行：
+   * 绝不进 recoveredText（chat.js 旧路径丢弃 recoveredText，误吞的真回答会消失），
+   * 也绝不进 errors（tool_error 抢在 malformed_protocol 之前断掉重试；被拒绝的形状
+   * 必须原样落进可见正文，让残渣检测按老规矩点火）。与流式路径的同名分支逐字对齐，
+   * parity 由测试钉住。
+   * @returns {number} 新的扫描位置
+   */
+  const resolveSyntheticAt = (from) => {
+    const object = extractBalancedObject(fullText, from);
+    if (!object) {
+      // 配不平的负载连闭标记门都到不了：剩余整段按正文放行（矩阵：接受的残余泄漏）。
+      warnings.push({ type: 'synthetic_rejected', reason: 'unbalanced payload', raw: '' });
+      logSyntheticRejected('unbalanced payload');
+      releaseProse(fullText.slice(from));
+      return fullText.length;
+    }
+    const closer = consumeMandatoryBracketCloser(fullText, object.end, false);
+    if (!closer.found) {
+      // 闭标记缺席或邻接违规：负载按正文放行，尾巴交还扫描循环。
+      warnings.push({ type: 'synthetic_rejected', reason: 'missing closer', raw: '' });
+      logSyntheticRejected('missing closer');
+      releaseProse(object.text);
+      return object.end;
+    }
+    const built = buildToolCallPayload(object.text);
+    const gateError = built.error || gateToolName(built.payload, allowedToolNames);
+    if (gateError) {
+      const reason = gateError.reason || gateError.type;
+      warnings.push({ type: 'synthetic_rejected', reason, raw: '' });
+      logSyntheticRejected(reason);
+      releaseProse(fullText.slice(from, closer.end));
+      return closer.end;
+    }
+    toolCalls.push(createToolCallObject(built.payload, toolCalls.length));
+    return consumeDuplicateClosers(fullText, closer.end, false).end;
+  };
 
-    const triggerAt = position + match.index;
+  while (position < fullText.length) {
+    // 代码上下文并进位置门：围栏/行内代码里的裸负载永远是文档，不产生合成开端
+    // （正则触发器的代码上下文处理保持原样，在下面按老规矩压制）。
+    const opening = matchToolCallOpening(fullText.slice(position), {
+      emittedProse: emittedProse || code.inCode()
+    });
+    if (!opening) break;
+
+    const triggerAt = position + opening.index;
     releaseProse(fullText.slice(position, triggerAt));
-    const afterTrigger = triggerAt + match[0].length;
+
+    if (opening.synthetic) {
+      position = resolveSyntheticAt(triggerAt);
+      continue;
+    }
+
+    const trigger = opening.text;
+    const afterTrigger = triggerAt + trigger.length;
 
     const suppress = (reason, log) => {
-      warnings.push({ type: 'triggered_unrecovered', reason, raw: match[0] });
-      log(match[0], reason);
-      releaseProse(match[0]);
+      warnings.push({ type: 'triggered_unrecovered', reason, raw: trigger });
+      log(trigger, reason);
+      releaseProse(trigger);
       position = afterTrigger;
     };
 
@@ -701,7 +866,7 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     }
 
     // `[tool calls](url) … {json}`：方括号触发器后面接的是 Markdown 链接收尾，不是调用。
-    if (isMarkdownLinkTail(match[0], fullText.slice(afterTrigger, payloadAt))) {
+    if (isMarkdownLinkTail(trigger, fullText.slice(afterTrigger, payloadAt))) {
       suppress('markdown link, not a call', logTriggerSuppressed);
       continue;
     }
@@ -712,7 +877,7 @@ const parseToolCallsFromText = (fullText, options = {}) => {
       const error = { type: 'truncated_tool_call', raw: fullText.slice(afterTrigger) };
       errors.push(error);
       logToolError(error);
-      releaseProse(match[0]);
+      releaseProse(trigger);
       position = afterTrigger;
       continue;
     }
@@ -731,9 +896,9 @@ const parseToolCallsFromText = (fullText, options = {}) => {
       warnings.push({
         type: 'triggered_unrecovered',
         reason: 'not the first content of the answer',
-        raw: match[0]
+        raw: trigger
       });
-      logTriggerSuppressed(match[0], 'not the first content of the answer');
+      logTriggerSuppressed(trigger, 'not the first content of the answer');
       position = spanEnd;
       continue;
     }
@@ -749,7 +914,12 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     }
 
     toolCalls.push(createToolCallObject(built.payload, toolCalls.length));
-    position = spanEnd;
+    // 只有**被接受的**调用才吞掉后面的重复闭标记（实测泄漏 #2 的
+    // `[END TOOL CALL][END TOOL CALL]`）。被拒绝/压制的片段保持旧行为 ——
+    // 流式路径的 closerSwallow 也只在调用发出后才布防，两条路径必须一致。
+    position = closer.end > afterFence
+      ? consumeDuplicateClosers(fullText, closer.end, false).end
+      : spanEnd;
   }
 
   releaseProse(fullText.slice(position));
@@ -777,6 +947,10 @@ const createToolCallStreamParser = (options = {}) => {
   let triggerText = '';
   let afterTrigger = '';
   let inToolCall = false;
+  let syntheticTrigger = false;
+  // 一个带闭标记的调用刚收尾：扫描循环里继续吞掉紧随其后的重复闭标记
+  // （实测泄漏 #2）。重复可能被切在 chunk 边界上，所以不能在结算点一次吞完。
+  let closerSwallow = false;
   let emittedCallCount = 0;
   let emittedProse = false;
 
@@ -823,8 +997,45 @@ const createToolCallStreamParser = (options = {}) => {
       triggerText = '';
       afterTrigger = '';
       inToolCall = false;
+      syntheticTrigger = false;
       return leftover;
     };
+
+    // 合成开端：afterTrigger 从 '{' 开始（drain 里按构造保证）。闸门与整段路径的
+    // resolveSyntheticAt 逐字对齐（parity 由测试钉住）；任何拒绝都按**正文**放行
+    // （textDelta），绝不进 recoveredText / errors —— 理由见整段路径同名函数。
+    if (syntheticTrigger) {
+      const object = extractBalancedObject(afterTrigger, 0);
+      if (!object) {
+        if (!flushing && afterTrigger.length <= TOOL_CALL_SPAN_MAX) return null;
+        // 配不平 + 流已终结：按正文放行（矩阵：接受的残余泄漏，terminalFinish 挡重试）。
+        warnings.push({ type: 'synthetic_rejected', reason: 'unbalanced payload', raw: '' });
+        logSyntheticRejected('unbalanced payload');
+        releaseProse(result, afterTrigger);
+        return finish('');
+      }
+      const closer = consumeMandatoryBracketCloser(afterTrigger, object.end, !flushing);
+      if (closer.needMore) return null;
+      if (!closer.found) {
+        warnings.push({ type: 'synthetic_rejected', reason: 'missing closer', raw: '' });
+        logSyntheticRejected('missing closer');
+        releaseProse(result, object.text);
+        return finish(afterTrigger.slice(object.end));
+      }
+      const built = buildToolCallPayload(object.text);
+      const gateError = built.error || gateToolName(built.payload, allowedToolNames);
+      if (gateError) {
+        const reason = gateError.reason || gateError.type;
+        warnings.push({ type: 'synthetic_rejected', reason, raw: '' });
+        logSyntheticRejected(reason);
+        releaseProse(result, afterTrigger.slice(0, closer.end));
+        return finish(afterTrigger.slice(closer.end));
+      }
+      result.completedCalls.push(createToolCallObject(built.payload, emittedCallCount));
+      emittedCallCount += 1;
+      closerSwallow = true;
+      return finish(afterTrigger.slice(closer.end));
+    }
 
     const suppress = (reason, log) => {
       warnings.push({ type: 'triggered_unrecovered', reason, raw: triggerText });
@@ -896,6 +1107,8 @@ const createToolCallStreamParser = (options = {}) => {
 
     result.completedCalls.push(createToolCallObject(built.payload, emittedCallCount));
     emittedCallCount += 1;
+    // 只有带闭标记收尾的被接受调用才布防重复闭标记的吞除 —— 与整段路径一致。
+    if (closer.end > afterFence) closerSwallow = true;
     return finish(leftover);
   };
 
@@ -914,18 +1127,46 @@ const createToolCallStreamParser = (options = {}) => {
       pendingText += buffer;
       if (!pendingText) return;
 
-      const match = pendingText.match(TOOL_CALL_TRIGGER_RE);
-      if (match) {
-        const before = pendingText.slice(0, match.index);
-        releaseProse(result, before);
-        const tail = pendingText.slice(match.index + match[0].length);
-        pendingText = '';
-        if (code.inCode()) {
-          warnings.push({ type: 'triggered_unrecovered', reason: 'inside code context', raw: match[0] });
-          logTriggerSuppressed(match[0], 'inside code context');
-          releaseProse(result, match[0]);
+      // 一个调用刚带着闭标记收尾：把紧随其后、已经能判定的重复闭标记吞掉
+      // （与整段路径 consumeDuplicateClosers 同一条规则）。尾巴还是纯空白或半个
+      // 闭标记前缀时扣住等下一个 chunk —— 调用早已发出，扣住的只是装饰性空白。
+      if (closerSwallow) {
+        const probe = pendingText.search(/\S/);
+        if (probe === -1) {
+          if (!flushing) return;
+          closerSwallow = false;
+        } else if (pendingText[probe] === '[' || pendingText[probe] === '<') {
+          const dup = consumeTrailingCloser(pendingText, 0, !flushing);
+          if (dup.needMore) return;
+          if (dup.end > 0) {
+            pendingText = pendingText.slice(dup.end);
+            buffer = '';
+            continue;
+          }
+          closerSwallow = false;
         } else {
-          triggerText = match[0];
+          closerSwallow = false;
+        }
+      }
+
+      // 代码上下文并进位置门（与整段路径同一条规则）：围栏/行内代码里的裸负载
+      // 永远是文档。合成开端本来就要求此前只有空白，而任何反引号都已把
+      // emittedProse 置位 —— 这里传 inCode() 是为了让规则显式，而不是依赖巧合。
+      const opening = matchToolCallOpening(pendingText, {
+        emittedProse: emittedProse || code.inCode()
+      });
+      if (opening) {
+        const before = pendingText.slice(0, opening.index);
+        releaseProse(result, before);
+        const tail = pendingText.slice(opening.index + opening.text.length);
+        pendingText = '';
+        if (!opening.synthetic && code.inCode()) {
+          warnings.push({ type: 'triggered_unrecovered', reason: 'inside code context', raw: opening.text });
+          logTriggerSuppressed(opening.text, 'inside code context');
+          releaseProse(result, opening.text);
+        } else {
+          triggerText = opening.text;
+          syntheticTrigger = opening.synthetic;
           afterTrigger = '';
           inToolCall = true;
         }
@@ -937,6 +1178,20 @@ const createToolCallStreamParser = (options = {}) => {
         releaseProse(result, pendingText);
         pendingText = '';
         return;
+      }
+
+      // 可能的合成开端还没揭晓：回答顶端（或上一个调用之后）只有空白 + 一个还没
+      // 配平的 '{'。这段既不能按 splitSafeText 放行（一放行 emittedProse 置位，
+      // 抢救永久死掉），又还判定不了（"name"/"arguments" 键可能在后面的 chunk 里）。
+      // 原地扣住等更多输入；上界与触发后的缓冲同一个 TOOL_CALL_SPAN_MAX，flush
+      // 走上面的放行分支兜底。已配平却不带两个键的对象是普通 JSON 答案，不扣。
+      if (!emittedProse && !code.inCode()) {
+        const braceAt = pendingText.search(/\S/);
+        if (braceAt !== -1 && pendingText[braceAt] === '{' &&
+            pendingText.length <= TOOL_CALL_SPAN_MAX &&
+            !extractBalancedObject(pendingText, braceAt)) {
+          return;
+        }
       }
 
       const { safe, remainder } = splitSafeText(pendingText);
@@ -1062,5 +1317,8 @@ module.exports = {
   createNativeToolCallAccumulator,
   looksLikeUnexecutedToolAction,
   containsOrphanProtocolResidue,
+  // 单一来源的负载形状谓词与开端识别器：残渣检测、合成开端、测试共用同一份。
+  isLeakedToolPayloadShape,
+  matchToolCallOpening,
   serializeToolArguments
 };

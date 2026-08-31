@@ -1291,7 +1291,7 @@ test('OpenAI gate: el leak de protocolo malformado se rechaza; JSON ordinario no
 test('OpenAI loop: turno interceptado reintenta una vez con el hint canonico y recupera', async () => {
   const sent = []
   const result = await runAgentTurn(
-    [agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION)],
+    [agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION)],
     async (body) => {
       sent.push(body)
       return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
@@ -1311,12 +1311,12 @@ test('OpenAI loop: turno interceptado reintenta una vez con el hint canonico y r
 test('OpenAI loop: la segunda interceptacion entrega el final envuelto tal cual (tope de uno)', async () => {
   let sent = 0
   const result = await runAgentTurn(
-    [agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION)],
+    [agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION)],
     async () => {
       sent += 1
       return {
         status: true,
-        response: agentTurnStream(agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION))
+        response: agentTurnStream(agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION))
       }
     }
   )
@@ -1346,7 +1346,7 @@ test('OpenAI loop: el leak malformado reintenta con su hint y recupera tool_call
 test('OpenAI loop: required_tool tapa la interceptacion pero el hint lleva el dato clave', async () => {
   const sent = []
   const result = await runAgentTurn(
-    [agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION)],
+    [agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION)],
     async (body) => {
       sent.push(body)
       return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
@@ -1358,4 +1358,51 @@ test('OpenAI loop: required_tool tapa la interceptacion pero el hint lleva el da
   const hint = JSON.stringify(sent[0])
   assert.match(hint, /violated tool_choice/, 'la razon elegida sigue siendo required_tool')
   assert.match(hint, /did not reach the client/, 'el dato de la interceptacion no puede perderse')
+})
+
+// ── Salvage de aperturas ausentes en la ruta OpenAI (spec toolcall-salvage) ──
+// El mismo AGENT_LEAK que arriba dispara malformed_protocol (nombre NO declarado)
+// se vuelve la llamada real cuando el cliente SI declaro la herramienta: el parser
+// compartido lo rescata y el turno se acepta como tool_calls sin gastar retries.
+
+test('OpenAI loop: el leak con nombre declarado se rescata como tool_calls, cero retries', async () => {
+  let sent = 0
+  const result = await runAgentTurn(
+    [agentAnswerFrame(AGENT_LEAK)],
+    async () => { sent += 1; return { status: false } },
+    { allowed_tool_names: ['read_file', 'AskUserQuestion'] }
+  )
+
+  assert.equal(sent, 0, 'la llamada rescatada no debe gastar ningun retry')
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(result.attempt.toolCalls.length, 1)
+  assert.equal(result.attempt.toolCalls[0].function.name, 'AskUserQuestion')
+  const args = JSON.parse(result.attempt.toolCalls[0].function.arguments)
+  assert.equal(args.questions[0].header, 'Env', 'los arguments anidados se perdieron en el rescate')
+  assert.equal(result.attempt.visibleText.trim(), '', 'texto del payload sobrevivio como respuesta visible')
+})
+
+// ── Filtro clientToolNames sobre la evidencia de interceptacion (unidad) ──
+// Solo los nombres que el cliente declaro cuentan como drops interceptados; los
+// tools internos de la plataforma (web_search / web_extractor / sin nombre) se
+// dropean y loguean igual, pero no arman el retry 'intercepted'.
+
+test('normalizer: clientToolNames filtra que drops cuentan como interceptacion', () => {
+  const filtered = createUpstreamDeltaNormalizer({ clientToolNames: ['read_file'] })
+  filtered({ role: 'function', phase: 'answer', name: 'web_search', content: 'x' })
+  filtered({ role: 'function', phase: 'answer', content: 'no-name frame' })
+  assert.deepEqual(filtered.interceptedToolNames, [], 'un tool interno de plataforma conto como evidencia')
+  filtered({ role: 'function', phase: 'answer', name: 'read_file', content: 'Tool read_file does not exists' })
+  assert.deepEqual(filtered.interceptedToolNames, ['read_file'])
+
+  // Sin la opcion, el comportamiento historico se conserva: todo drop se registra.
+  const legacy = createUpstreamDeltaNormalizer()
+  legacy({ role: 'function', phase: 'answer', name: 'web_search', content: 'x' })
+  assert.deepEqual(legacy.interceptedToolNames, ['web_search'])
+
+  // Un set vacio equivale a no filtrar (peticiones sin tools no cambian de semantica).
+  const empty = createUpstreamDeltaNormalizer({ clientToolNames: [] })
+  empty({ role: 'function', phase: 'answer', name: 'web_search', content: 'x' })
+  assert.deepEqual(empty.interceptedToolNames, ['web_search'])
 })

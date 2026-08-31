@@ -520,7 +520,19 @@ const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
  * @returns {(delta: object) => ({ phase: string, content: string }|null)}
  */
 const INTERCEPTED_NAMES_CAP = 20
-const createUpstreamDeltaNormalizer = () => {
+const createUpstreamDeltaNormalizer = (options = {}) => {
+    // clientToolNames：客户端本次请求声明的工具名集合。传入后，只有这些名字的
+    // role:function 丢弃帧才计入 interceptedToolNames —— 平台自己的内部工具
+    // （web_search / web_extractor）和无名帧（'unknown'）会在纯散文回合上出现，
+    // 把它们当拦截证据会烧掉共享的协议恢复名额、触发假 intercepted 重试
+    // （实测 2026-08-31）。不传则照旧全记：签名向后兼容。日志不过滤 —— 每一次
+    // 丢弃都要留痕。
+    const clientToolNames = (() => {
+        const names = options.clientToolNames
+        if (!names) return null
+        const set = names instanceof Set ? names : new Set(names)
+        return set.size > 0 ? set : null
+    })()
     let summaryThoughtCount = 0
     const normalize = (delta) => {
         if (!delta) return null
@@ -532,7 +544,8 @@ const createUpstreamDeltaNormalizer = () => {
         // so surface them for retry decisions instead of only logging.
         if (delta.role === 'function') {
             const interceptedName = delta.name || 'unknown'
-            if (normalize.interceptedToolNames.length < INTERCEPTED_NAMES_CAP &&
+            if ((!clientToolNames || clientToolNames.has(interceptedName)) &&
+                normalize.interceptedToolNames.length < INTERCEPTED_NAMES_CAP &&
                 !normalize.interceptedToolNames.includes(interceptedName)) {
                 normalize.interceptedToolNames.push(interceptedName)
             }

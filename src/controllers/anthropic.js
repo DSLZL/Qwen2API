@@ -596,6 +596,11 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let upstreamCompleted;
   let upstreamEventCount;
   let visibleText = '';
+  // 本轮 attempt 写到线上的正文。visibleText 是跨轮累计（它如实映照线上已发出的
+  // 一切，供 empty 判定和"已见正文只许一次补偿"守卫使用）；但 malformed_protocol /
+  // missing_tool 检查的是**这一轮**说了什么 —— 上一轮泄漏的残渣已经重试过了，
+  // 拿累计文本判会把成功的重试轮再判一次死。
+  let attemptVisibleText = '';
 
   // 每个 attempt 都必须拿到全新的解析器。旧代码只建一次，于是补偿重试会继承上一轮的
   // 错误列表（hasParseError 永远为真，即使重试本身成功），而一个被截断的 <tool_call>
@@ -620,7 +625,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // 但本控制器没有 Agent 回合门禁去解包，标签会原样发给客户端。剥掉它们。
     agentTagStripper = createAgentTagStripper();
     recoveredBuffer = '';
-    normalizeDelta = createUpstreamDeltaNormalizer();
+    attemptVisibleText = '';
+    // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）——
+    // 平台内部工具的丢弃帧不再触发假 intercepted 重试、不再烧协议恢复名额。
+    normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames });
     acceptUpstreamFrame = createUpstreamResponseFilter();
     upstreamFinishReason = null;
   };
@@ -681,7 +689,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
    */
   const emitTextDelta = (text, { countsAsVisible = true } = {}) => {
     if (!text) return;
-    if (countsAsVisible) visibleText += text;
+    if (countsAsVisible) {
+      visibleText += text;
+      attemptVisibleText += text;
+    }
     if (!textBlockOpen) {
       closeThinkingBlockIfOpen();
       blockIndex += 1;
@@ -808,13 +819,13 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     if (hasTools && normalizeDelta.interceptedToolNames.length > 0 && !terminalFinish()) {
       return 'intercepted';
     }
-    // 同族防御：模型把方括号协议写坏（孤儿闭标记 / 开头裸负载），没有触发器可
-    // 点火，整段泄漏为可见正文。只是重试信号，泄漏的 JSON 永远不执行。
-    // intercepted 在前——丢弃帧是更强的证据。
-    if (hasTools && containsOrphanProtocolResidue(visibleText) && !terminalFinish()) {
+    // 同族防御：模型把方括号协议写坏，解析器的抢救闸门也没收下（未知名字 / 缺
+    // 闭标记 / 非法 JSON），残渣按正文泄漏。只是重试信号。intercepted 在前——
+    // 丢弃帧是更强的证据。判**本轮**文本，不判累计：上一轮的残渣已经重试过了。
+    if (hasTools && containsOrphanProtocolResidue(attemptVisibleText) && !terminalFinish()) {
       return 'malformed_protocol';
     }
-    if (hasTools && looksLikeUnexecutedToolAction(visibleText) && !terminalFinish()) {
+    if (hasTools && looksLikeUnexecutedToolAction(attemptVisibleText) && !terminalFinish()) {
       return 'missing_tool';
     }
     if (!visibleText.trim() && !terminalFinish()) return 'empty';
@@ -1060,7 +1071,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let nativeToolAccumulator = hasTools
     ? createNativeToolCallAccumulator({ allowedToolNames })
     : null;
-  const normalizeDelta = createUpstreamDeltaNormalizer();
+  // clientToolNames：与流式分支同一条规则 —— 平台内部工具的丢弃帧不算拦截证据。
+  const normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames });
   const acceptUpstreamFrame = createUpstreamResponseFilter();
 
   /**

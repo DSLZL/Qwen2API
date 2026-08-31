@@ -112,6 +112,13 @@ const LEAK_VALID_JSON_DOUBLE_CLOSER = [
   '[END TOOL CALL]'
 ].join('\n');
 
+// Leak real #3 (live-verified 2026-08-31 10:12–10:17): payload MCP de context7 +
+// [END TOOL CALL], sin opener, entregado como texto con CERO lineas de retry en logs.
+const LEAK_MCP_CONTEXT7 = [
+  '{"name": "mcp__context7__resolve-library-id", "arguments": {"libraryName": "heroui", "query": "table component"}}',
+  '[END TOOL CALL]'
+].join('\n');
+
 const scriptedSender = (...turns) => {
   const queue = [...turns];
   const fn = async (body) => {
@@ -150,7 +157,7 @@ const toolUseNames = (output) =>
 describe('interception-aware retry (stream)', () => {
   it('recovers the turn: one retry with the canonical hint, tool_use after the narration', async () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
-    const res = await runStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+    const res = await runStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender);
 
     assert.equal(sender.calls.length, 1, 'the interception must trigger exactly one retry');
     assert.deepEqual(toolUseNames(res.output), ['read_file']);
@@ -170,10 +177,10 @@ describe('interception-aware retry (stream)', () => {
 
   it('two consecutive interceptions: exactly one retry, closes without error events', async () => {
     const sender = scriptedSender(
-      turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)),
-      turnOf(interceptionFrame('Bash'), answerFrame(NARRATION))
+      turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)),
+      turnOf(interceptionFrame('read_file'), answerFrame(NARRATION))
     );
-    const res = await runStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+    const res = await runStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender);
 
     assert.equal(sender.calls.length, 1, 'second interception must deliver as-is, no loop');
     assert.doesNotMatch(res.output, /"type":"error"/);
@@ -185,18 +192,18 @@ describe('interception-aware retry (stream)', () => {
     // prosa" nunca se activa: solo el tope dedicado puede parar el loop. Con
     // AGENT_TURN_MAX_ATTEMPTS=3, quitar el tope daria 2 retries, no 1.
     const sender = scriptedSender(
-      turnOf(interceptionFrame('Bash')),
-      turnOf(interceptionFrame('Bash')),
-      turnOf(interceptionFrame('Bash'))
+      turnOf(interceptionFrame('read_file')),
+      turnOf(interceptionFrame('read_file')),
+      turnOf(interceptionFrame('read_file'))
     );
-    await runStream(turnOf(interceptionFrame('Bash')), sender);
+    await runStream(turnOf(interceptionFrame('read_file')), sender);
 
     assert.equal(sender.calls.length, 1, 'exactly ONE interception retry per request');
   });
 
   it('benign speculative drop: drops alongside an accepted call never retry', async () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
-    const res = await runStream(turnOf(interceptionFrame('Bash'), answerFrame(BRACKET_CALL)), sender);
+    const res = await runStream(turnOf(interceptionFrame('read_file'), answerFrame(BRACKET_CALL)), sender);
 
     assert.equal(sender.calls.length, 0, 'an accepted bracket call means the turn is fine');
     assert.deepEqual(toolUseNames(res.output), ['read_file']);
@@ -206,7 +213,7 @@ describe('interception-aware retry (stream)', () => {
   it('no tools in play: drops on a prose-only request never retry', async () => {
     const sender = scriptedSender(turnOf(answerFrame('unused')));
     const res = await runStream(
-      turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)),
+      turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)),
       sender,
       { hasTools: false, allowedToolNames: [] }
     );
@@ -219,7 +226,7 @@ describe('interception-aware retry (stream)', () => {
 describe('interception-aware retry (non-stream)', () => {
   it('clean retry: nothing was sent yet, tool_use lands in the response', async () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
-    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+    const res = await runNonStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender);
 
     assert.equal(sender.calls.length, 1);
     assert.match(JSON.stringify(sender.calls[0]), /did not reach the client/);
@@ -233,10 +240,10 @@ describe('interception-aware retry (non-stream)', () => {
     // Este loop no tiene guard de texto-ya-enviado (nada salio al cliente), asi que sin
     // el tope dedicado reintentaria hasta maxAttempts: 2 retries en vez de 1.
     const sender = scriptedSender(
-      turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)),
-      turnOf(interceptionFrame('Bash'), answerFrame(NARRATION))
+      turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)),
+      turnOf(interceptionFrame('read_file'), answerFrame(NARRATION))
     );
-    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+    const res = await runNonStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender);
 
     assert.equal(sender.calls.length, 1, 'exactly ONE interception retry per request');
     assert.equal(res.statusCode, 200, 'deliver as-is, not an error');
@@ -250,7 +257,7 @@ describe('interception-aware retry (non-stream)', () => {
     // El rebuild del retry descarta el cleanedText del attempt 1; sin el fallback,
     // el handler caia en el 502 de "!cleanedText.trim()" y cambiaba narracion por error.
     const sender = scriptedSender(turnOf());
-    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+    const res = await runNonStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender);
 
     assert.equal(res.statusCode, 200, 'the narration must beat a 502');
     const text = (res.body?.content || []).filter(block => block.type === 'text').map(block => block.text).join('');
@@ -265,7 +272,7 @@ describe('interception-aware retry (non-stream)', () => {
     // attempt 1 siguen vivos en el attempt 2 → segunda "interceptacion" fantasma →
     // el tope corta el loop y la respuesta se degrada (1 retry, sin tool_use).
     const sender = scriptedSender(turnOf(), turnOf(answerFrame(BRACKET_CALL)));
-    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+    const res = await runNonStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender);
 
     assert.equal(sender.calls.length, 2, 'interception retry then empty retry');
     assert.equal(res.statusCode, 200);
@@ -276,7 +283,7 @@ describe('interception-aware retry (non-stream)', () => {
 
   it('benign speculative drop: an accepted call alongside drops never retries', async () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
-    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(BRACKET_CALL)), sender);
+    const res = await runNonStream(turnOf(interceptionFrame('read_file'), answerFrame(BRACKET_CALL)), sender);
 
     assert.equal(sender.calls.length, 0);
     const toolBlocks = (res.body?.content || []).filter(block => block.type === 'tool_use');
@@ -286,7 +293,7 @@ describe('interception-aware retry (non-stream)', () => {
   it('no tools in play: drops on a prose-only request never retry', async () => {
     const sender = scriptedSender(turnOf(answerFrame('unused')));
     const res = await runNonStream(
-      turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)),
+      turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)),
       sender,
       { hasTools: false, allowedToolNames: [] }
     );
@@ -306,13 +313,13 @@ describe('interception observability (finding 3)', () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
     let hint;
     const warns = await captureWarns(async () => {
-      await runStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender, { toolChoice: 'required' });
+      await runStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender, { toolChoice: 'required' });
       hint = JSON.stringify(sender.calls[0]);
     });
 
     assert.ok(
-      warns.some(line => /required; dropped: Bash/.test(line)),
-      `expected a "required; dropped: Bash" warn, got:\n${warns.join('\n')}`
+      warns.some(line => /required; dropped: read_file/.test(line)),
+      `expected a "required; dropped: read_file" warn, got:\n${warns.join('\n')}`
     );
     // finding 4 para la razon required: el hint lleva el dato clave ademas del suyo.
     assert.match(hint, /You did not call any tool/);
@@ -320,14 +327,14 @@ describe('interception observability (finding 3)', () => {
   });
 
   it('the give-up on a second interception is logged with the names', async () => {
-    const sender = scriptedSender(turnOf(interceptionFrame('Bash')), turnOf(interceptionFrame('Bash')));
+    const sender = scriptedSender(turnOf(interceptionFrame('read_file')), turnOf(interceptionFrame('read_file')));
     const warns = await captureWarns(async () => {
-      await runStream(turnOf(interceptionFrame('Bash')), sender);
+      await runStream(turnOf(interceptionFrame('read_file')), sender);
     });
 
     assert.equal(sender.calls.length, 1);
     assert.ok(
-      warns.some(line => /协议恢复重试已用完/.test(line) && /dropped: Bash/.test(line)),
+      warns.some(line => /协议恢复重试已用完/.test(line) && /dropped: read_file/.test(line)),
       `expected a give-up warn with the dropped names, got:\n${warns.join('\n')}`
     );
   });
@@ -341,7 +348,7 @@ describe('intercepted outranks missing_tool (finding 4)', () => {
     // el hint (via el append enmascarado) — esta prueba falla bajo ese swap.
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
     const res = await runStream(
-      turnOf(interceptionFrame('Bash'), answerFrame("I'll run the Bash command again.")),
+      turnOf(interceptionFrame('read_file'), answerFrame("I'll run the Bash command again.")),
       sender
     );
 
@@ -358,7 +365,7 @@ describe('documented limitation: the after-prose allowance is shared (finding 8)
     // attempt 1: prosa missing_tool consume retriedAfterVisibleText → retry 1.
     // attempt 2: interceptacion + narracion — el tope compartido de protocolo esta
     // libre, pero la guarda de texto-ya-enviado corta el loop → entrega tal cual.
-    const sender = scriptedSender(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)));
+    const sender = scriptedSender(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)));
     const res = await runStream(turnOf(answerFrame('I will run the build now.')), sender);
 
     assert.equal(sender.calls.length, 1, 'only the missing_tool retry fired');
@@ -418,7 +425,7 @@ describe('malformed bracket protocol (finding 10)', () => {
       turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)),
       turnOf(answerFrame(BRACKET_CALL))
     );
-    const res = await runStream(turnOf(interceptionFrame('Bash')), sender);
+    const res = await runStream(turnOf(interceptionFrame('read_file')), sender);
 
     assert.equal(sender.calls.length, 1, 'one protocol-recovery retry TOTAL, not one per reason');
     assert.match(res.output, /"type":"message_stop"/);
@@ -431,6 +438,120 @@ describe('malformed bracket protocol (finding 10)', () => {
     assert.equal(sender.calls.length, 1);
     assert.match(JSON.stringify(sender.calls[0]), /was NOT executed/);
     assert.equal(res.statusCode, 200);
+    const toolBlocks = (res.body?.content || []).filter(block => block.type === 'tool_use');
+    assert.deepEqual(toolBlocks.map(block => block.name), ['read_file']);
+  });
+});
+
+// ── Salvage de aperturas ausentes (spec toolcall-salvage) ──
+// Los mismos leaks, pero con el nombre DECLARADO por el cliente: ya no son residuo
+// que reintentar sino la llamada que el modelo intento emitir. Cero retries, cero
+// texto de payload en el wire, tool_use directo. (Arriba, los mismos fixtures con
+// nombres NO permitidos siguen probando la ruta de retry: la puerta de nombres es
+// exactamente lo que separa ambos destinos.)
+
+const SALVAGE_TOOLS = ['read_file', 'Bash', 'AskUserQuestion', 'mcp__context7__resolve-library-id'];
+
+/** Todo el texto visible (text_delta) que llego al cliente, sin escapes SSE. */
+const textDeltasOf = (output) =>
+  [...output.matchAll(/"delta":\{"type":"text_delta","text":("(?:[^"\\]|\\.)*")\}/g)]
+    .map(m => JSON.parse(m[1]))
+    .join('');
+
+describe('opener-less salvage: los tres leaks reales se vuelven tool_use', () => {
+  const CASES = [
+    ['leak #1: dos payloads Bash con closers', LEAK_PAYLOAD_CLOSER, ['Bash', 'Bash']],
+    ['leak #2: AskUserQuestion con closers doblados', LEAK_VALID_JSON_DOUBLE_CLOSER, ['AskUserQuestion']],
+    ['leak #3: payload MCP context7', LEAK_MCP_CONTEXT7, ['mcp__context7__resolve-library-id']]
+  ];
+
+  for (const [label, leak, names] of CASES) {
+    it(`stream: ${label}`, async () => {
+      const sender = scriptedSender(turnOf(answerFrame('retry would consume this')));
+      const res = await runStream(turnOf(answerFrame(leak)), sender, { allowedToolNames: SALVAGE_TOOLS });
+
+      assert.equal(sender.calls.length, 0, 'la llamada rescatada no debe gastar ningun retry');
+      assert.deepEqual(toolUseNames(res.output), names);
+      assert.equal(textDeltasOf(res.output).trim(), '', 'texto del payload llego al cliente');
+      assert.match(res.output, /"stop_reason":"tool_use"/);
+      assert.doesNotMatch(res.output, /"type":"error"/);
+    });
+
+    it(`non-stream: ${label}`, async () => {
+      const sender = scriptedSender(turnOf(answerFrame('retry would consume this')));
+      const res = await runNonStream(turnOf(answerFrame(leak)), sender, { allowedToolNames: SALVAGE_TOOLS });
+
+      assert.equal(sender.calls.length, 0);
+      assert.equal(res.statusCode, 200);
+      const blocks = res.body?.content || [];
+      assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), names);
+      const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('');
+      assert.equal(text.trim(), '', 'texto del payload llego al cliente');
+      assert.equal(res.body.stop_reason, 'tool_use');
+    });
+  }
+
+  it('stream: los argumentos del payload rescatado llegan enteros al tool_use', async () => {
+    const res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), scriptedSender(), { allowedToolNames: SALVAGE_TOOLS });
+    assert.match(res.output, /find \. -type f/, 'los arguments del primer payload se perdieron');
+    assert.match(res.output, /"input_json_delta"/);
+  });
+
+  it('stream: el leak partido en la frontera del chunk se rescata igual (payload y closer en deltas distintos)', async () => {
+    const [payloadLine, closerLine] = LEAK_MCP_CONTEXT7.split('\n');
+    const res = await runStream(
+      turnOf(answerFrame(payloadLine.slice(0, 40)), answerFrame(payloadLine.slice(40) + '\n'), answerFrame(closerLine)),
+      scriptedSender(),
+      { allowedToolNames: SALVAGE_TOOLS }
+    );
+    assert.deepEqual(toolUseNames(res.output), ['mcp__context7__resolve-library-id']);
+    assert.equal(textDeltasOf(res.output).trim(), '');
+  });
+});
+
+// ── Filtro de nombres de cliente sobre la evidencia de interceptacion ──
+// La plataforma dropea sus PROPIOS frames role:function (web_search, web_extractor,
+// sin nombre) en turnos de prosa normales. Antes contaban como evidencia de
+// interceptacion: retry 'intercepted' falso + el cupo compartido de recuperacion
+// quemado. Solo los nombres que el cliente declaro como tools son evidencia.
+
+describe('platform-internal drops are not interception evidence (clientToolNames filter)', () => {
+  it('web_search drops on a prose turn: no retry, slot preserved, drop still logged', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('unused')));
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runStream(turnOf(interceptionFrame('web_search'), answerFrame(NARRATION)), sender);
+    });
+
+    assert.equal(sender.calls.length, 0, 'un drop de web_search disparo un retry intercepted falso');
+    assert.match(res.output, /"type":"message_stop"/);
+    assert.ok(
+      warns.some(line => /Dropped upstream role:function/.test(line) && /web_search/.test(line)),
+      `el drop debe seguir logueandose aunque no cuente como evidencia:\n${warns.join('\n')}`
+    );
+  });
+
+  it('a no-name platform frame is filtered the same way', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('unused')));
+    const noNameFrame = `data: ${JSON.stringify({
+      choices: [{ delta: { role: 'function', phase: 'answer', content: 'internal lookup' }, finish_reason: null }]
+    })}\n\n`;
+    const res = await runStream(turnOf(noNameFrame, answerFrame(NARRATION)), sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.match(res.output, /"type":"message_stop"/);
+  });
+
+  it('non-stream: web_search drops do not burn the shared recovery slot', async () => {
+    // El slot queda libre: un leak malformado en el retry posterior AUN puede usarlo.
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runNonStream(
+      turnOf(interceptionFrame('web_search'), answerFrame(LEAK_PAYLOAD_CLOSER)),
+      sender
+    );
+
+    assert.equal(sender.calls.length, 1, 'el retry malformed_protocol debia disparar con el slot libre');
+    assert.match(JSON.stringify(sender.calls[0]), /was NOT executed/);
     const toolBlocks = (res.body?.content || []).filter(block => block.type === 'tool_use');
     assert.deepEqual(toolBlocks.map(block => block.name), ['read_file']);
   });
