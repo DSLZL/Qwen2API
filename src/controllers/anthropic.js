@@ -601,6 +601,15 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // missing_tool 检查的是**这一轮**说了什么 —— 上一轮泄漏的残渣已经重试过了，
   // 拿累计文本判会把成功的重试轮再判一次死。
   let attemptVisibleText = '';
+  // 本轮 attempt 的**原始**思考文本（不含注入的 searchTable）。think 内容照旧
+  // verbatim 流给客户端（遏制是另案，见 deferred-work），但回合定案时要拿它过一遍
+  // 共享解析器：实测 2026-08-31 ~14:08 模型把整个 [TOOL_CALL] 负载写进 think phase，
+  // 然后在正文里叙述"已完成" —— 调用没执行、没进重试信号、没人看见。OpenAI 路径（A）
+  // 早有这道防御（openai-agent-runtime.js:232-246）；这里把 B 拉到同一水位。
+  let attemptThinkText = '';
+  // 思维阶段的排放证据：think 文本过共享解析器后出现调用或解析错误，却没资格
+  // 晋升（守卫见回合定案处）。decideRetryReason 据此点起一次性 thought_tool_call。
+  let attemptThinkEvidence = false;
 
   // 每个 attempt 都必须拿到全新的解析器。旧代码只建一次，于是补偿重试会继承上一轮的
   // 错误列表（hasParseError 永远为真，即使重试本身成功），而一个被截断的 <tool_call>
@@ -626,6 +635,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     agentTagStripper = createAgentTagStripper();
     recoveredBuffer = '';
     attemptVisibleText = '';
+    attemptThinkText = '';
+    attemptThinkEvidence = false;
     // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）——
     // 平台内部工具的丢弃帧不再触发假 intercepted 重试、不再烧协议恢复名额。
     normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames });
@@ -781,6 +792,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
           } catch (_) {}
         }
       }
+      // 只累计模型自己的思考文本 —— 注入的 searchTable 不是模型输出，不能污染
+      // 回合定案时的 think 解析。
+      attemptThinkText += content;
       emitThinkingDelta(content);
     } else if (delta.phase === 'answer') {
       if (parser) {
@@ -825,6 +839,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     if (hasTools && containsOrphanProtocolResidue(attemptVisibleText) && !terminalFinish()) {
       return 'malformed_protocol';
     }
+    // 同族第三形态：调用（或其残骸）泄漏在 think phase 里，晋升守卫没放行。
+    // 排在 missing_tool 之前 —— think 里的排放证据比正文措辞的启发式更硬。
+    // 泄漏的调用永远不从这里执行，这只是重试信号。
+    if (hasTools && attemptThinkEvidence && !terminalFinish()) {
+      return 'thought_tool_call';
+    }
     if (hasTools && looksLikeUnexecutedToolAction(attemptVisibleText) && !terminalFinish()) {
       return 'missing_tool';
     }
@@ -839,6 +859,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     else if (reason === 'empty') hint = buildEmptyOutputRetryHint();
     else if (reason === 'intercepted') hint = buildAgentRetryHint('intercepted');
     else if (reason === 'malformed_protocol') hint = buildAgentRetryHint('malformed_protocol');
+    else if (reason === 'thought_tool_call') hint = buildAgentRetryHint('thought_tool_call');
     else hint = buildToolErrorRetryHint(currentToolErrors(), allowedToolNames);
     // required / missing_tool 优先级高于 intercepted，会把拦截藏在自己后面。
     // 不动优先级、不动上限——只让提示词把关键事实带上：调用没到客户端。
@@ -891,16 +912,49 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     for (const call of nativeToolCalls) emitToolUse(call);
     hasEmittedToolCalls = !!(nativeToolCalls.length > 0 || parser?.hasEmittedAnyCall());
 
-    const retryReason = decideRetryReason(hasEmittedToolCalls);
-    if (!retryReason || attemptsMade >= maxAttempts) break;
+    // think phase 的回合定案：正文侧一无所获时，把本轮思考文本过一遍共享解析器。
+    // 晋升守卫与 A 逐字对齐（openai-agent-runtime.js:232-246）：正文零调用、正文
+    // 可见文本为空、正文侧零工具错误、think 解析出 ≥1 个调用、think 除调用外一无
+    // 所有（cleanedText 空）、think 解析零错误 —— 且必须有**非空**的白名单（无白名单
+    // 时共享解析器的名字闸门放行一切，fail closed：不晋升）。这不是新的安全边界：
+    // A 自兼容工作以来一直在做同一个晋升，同一套守卫。守卫不满足但 think 里确实
+    // 出现了调用（或其解析残骸）时，那是排放证据 —— 交给 thought_tool_call 重试。
+    if (hasTools && !hasEmittedToolCalls) {
+      const thinkParsed = parseToolCallsFromText(attemptThinkText, { allowedToolNames });
+      const promotable = allowedToolNames.length > 0 &&
+        thinkParsed.toolCalls.length > 0 &&
+        thinkParsed.errors.length === 0 &&
+        !thinkParsed.cleanedText.trim() &&
+        !attemptVisibleText.trim() &&
+        currentToolErrors().length === 0;
+      if (promotable) {
+        for (const call of thinkParsed.toolCalls) emitToolUse(call);
+        hasEmittedToolCalls = true;
+      } else {
+        attemptThinkEvidence = thinkParsed.toolCalls.length > 0 || thinkParsed.errors.length > 0;
+      }
+    }
 
-    // 协议恢复重试（intercepted 与 malformed_protocol 共享同一个名额）整个请求
-    // 只允许一次：第二次说明提示没被采纳，继续循环只会把更多叙述散文拼进客户端
-    // 的流。原样交付比死循环好。两个理由绝不能叠成两次额外重试。注意这个上限
-    // 独立于下面的已见正文守卫 —— 无叙述的拦截（零可见正文）也必须停在一次。
-    // 放弃时必须留日志：生产环境要能区分"提示被采纳、回合恢复"和"第二次、
-    // 原样交付"。
-    const isProtocolRecovery = retryReason === 'intercepted' || retryReason === 'malformed_protocol';
+    const retryReason = decideRetryReason(hasEmittedToolCalls);
+    if (!retryReason) break;
+    if (attemptsMade >= maxAttempts) {
+      // 以前这里静默 break：生产环境分不清"回合被接受"和"次数用尽、按原样交付"。
+      logger.warn(
+        `Anthropic Agent 尝试次数用尽（${attemptsMade}/${maxAttempts}），最后一轮仍被拒绝 (${retryReason})，按原样交付`,
+        'ANTHROPIC'
+      );
+      break;
+    }
+
+    // 协议恢复重试（intercepted / malformed_protocol / thought_tool_call 共享同一个
+    // 名额）整个请求只允许一次：第二次说明提示没被采纳，继续循环只会把更多叙述
+    // 散文拼进客户端的流。原样交付比死循环好。三个理由绝不能叠成多次额外重试。
+    // 注意这个上限独立于下面的已见正文守卫 —— 无叙述的拦截（零可见正文）也必须
+    // 停在一次。放弃时必须留日志：生产环境要能区分"提示被采纳、回合恢复"和
+    // "第二次、原样交付"。
+    const isProtocolRecovery = retryReason === 'intercepted' ||
+      retryReason === 'malformed_protocol' ||
+      retryReason === 'thought_tool_call';
     if (isProtocolRecovery && protocolRecoveryRetried) {
       const giveUpDrops = normalizeDelta.interceptedToolNames.length > 0
         ? ` (dropped: ${normalizeDelta.interceptedToolNames.join(', ')})`
@@ -928,7 +982,16 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       //
       // 已知局限（有测试钉住）：如果这个名额先被别的理由（如 missing_tool）用掉，
       // 之后一轮带叙述的拦截就无法重试 —— 按原样交付收场。
-      if (retryReason === 'tool_error') break;
+      // thought_tool_call 消费的同样是这一次"已见正文后的补偿"名额：叙述已经流出
+      // 去了，但迟到的 tool_use 仍然胜过一个死掉的会话（与 intercepted 同一条道理）。
+      if (retryReason === 'tool_error') {
+        // 以前这里静默 break：生产环境看不见"本轮是垃圾、按原样交付"的定案。
+        logger.warn(
+          `Anthropic Agent 已见正文后本轮出现 tool_error，不再重试，按原样交付 (${describeToolErrors(currentToolErrors())})`,
+          'ANTHROPIC'
+        );
+        break;
+      }
       if (retriedAfterVisibleText) break;
       retriedAfterVisibleText = true;
     }
@@ -973,7 +1036,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     emitTextDelta(stripAgentTags(recoveredBuffer), { countsAsVisible: false });
   }
   if (!hasToolProtocolError && finalToolErrors.length > 0) {
-    logger.warning?.(
+    // logger 上只有 warn，没有 warning —— 旧的 logger.warning?.() 是静默空操作。
+    logger.warn(
       `Anthropic Agent 工具协议出错但已产出内容，按正常回答返回 (${describeToolErrors(finalToolErrors)})`,
       'ANTHROPIC'
     );
@@ -986,7 +1050,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     const detail = finalToolErrors.length
       ? describeToolErrors(finalToolErrors)
       : 'tool_choice=required 未触发任何工具调用';
-    logger.warning?.(
+    logger.warn(
       `Anthropic Agent 工具协议失败，${attemptsMade}/${maxAttempts} 次尝试后放弃 (${detail})`,
       'ANTHROPIC'
     );
@@ -1061,6 +1125,10 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   } = ctx;
 
   let thinkingContent = '';
+  // 本轮 attempt 的原始思考文本。thinkingContent 跨轮累计、原样进响应的 thinking
+  // 块（既有语义不动）；回合**判定**（晋升 / thought_tool_call 证据）只看这一轮 ——
+  // 与流式分支同一条纪律，上一轮的泄漏已经重试过了。
+  let attemptThinkingContent = '';
   let answerContent = '';
   let promptTokens = 0;
   let completionTokens = 0;
@@ -1107,6 +1175,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     const content = normalized.content;
     if (delta.phase === 'think') {
       thinkingContent += content;
+      attemptThinkingContent += content;
     } else if (delta.phase === 'answer') {
       answerContent += content;
     }
@@ -1150,6 +1219,29 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
 
+  // think phase 的回合定案（与流式分支同一套，注释见彼处）：正文侧一无所获时把
+  // 本轮思考文本过共享解析器 —— 晋升守卫与 A 逐字对齐（openai-agent-runtime.js:
+  // 232-246，含无白名单不晋升的 fail closed），守卫不满足但确有调用/残骸时留下
+  // thought_tool_call 的排放证据。每次正文重新结算后都要重新定案。
+  let attemptThinkEvidence = false;
+  const settleThinkPhase = () => {
+    attemptThinkEvidence = false;
+    if (!hasTools || toolCalls.length > 0) return;
+    const thinkParsed = parseToolCallsFromText(attemptThinkingContent, { allowedToolNames });
+    const promotable = allowedToolNames.length > 0 &&
+      thinkParsed.toolCalls.length > 0 &&
+      thinkParsed.errors.length === 0 &&
+      !thinkParsed.cleanedText.trim() &&
+      !cleanedText.trim() &&
+      toolErrors.length === 0;
+    if (promotable) {
+      toolCalls = thinkParsed.toolCalls.map((call, index) => ({ ...call, index }));
+      return;
+    }
+    attemptThinkEvidence = thinkParsed.toolCalls.length > 0 || thinkParsed.errors.length > 0;
+  };
+  settleThinkPhase();
+
   // 非流式没有"已经写到线上"的问题：什么都还没发出去，所以每一轮都可以重试。
   const terminalFinish = () =>
     ['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
@@ -1170,6 +1262,11 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 只是重试信号，泄漏的 JSON 永远不执行。intercepted 在前——丢弃帧是更强的证据。
     if (hasTools && containsOrphanProtocolResidue(cleanedText) && !terminalFinish()) {
       return 'malformed_protocol';
+    }
+    // 同族第三形态：调用（或其残骸）泄漏在 think phase 里，晋升守卫没放行。
+    // 排在 missing_tool 之前；泄漏的调用永远不从这里执行，这只是重试信号。
+    if (hasTools && attemptThinkEvidence && !terminalFinish()) {
+      return 'thought_tool_call';
     }
     if (hasTools && looksLikeUnexecutedToolAction(cleanedText) && !terminalFinish()) {
       return 'missing_tool';
@@ -1192,11 +1289,13 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     const retryReason = decideRetryReason();
     if (!retryReason) break;
 
-    // 与流式分支同一条纪律：协议恢复重试（intercepted / malformed_protocol 共享
-    // 同一个名额）整个请求只允许一次。第二次说明提示没被采纳，把叙述散文按正常
-    // 回答交付，别再烧尝试次数。放弃时留日志：生产环境要能区分"提示被采纳、
-    // 回合恢复"和"第二次、原样交付"。
-    const isProtocolRecovery = retryReason === 'intercepted' || retryReason === 'malformed_protocol';
+    // 与流式分支同一条纪律：协议恢复重试（intercepted / malformed_protocol /
+    // thought_tool_call 共享同一个名额）整个请求只允许一次。第二次说明提示没被
+    // 采纳，把叙述散文按正常回答交付，别再烧尝试次数。放弃时留日志：生产环境
+    // 要能区分"提示被采纳、回合恢复"和"第二次、原样交付"。
+    const isProtocolRecovery = retryReason === 'intercepted' ||
+      retryReason === 'malformed_protocol' ||
+      retryReason === 'thought_tool_call';
     if (isProtocolRecovery) {
       if (protocolRecoveryRetried) {
         const giveUpDrops = normalizeDelta.interceptedToolNames.length > 0
@@ -1227,7 +1326,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         ? buildMissingToolRetryHint()
         : (retryReason === 'empty'
           ? buildEmptyOutputRetryHint()
-          : (retryReason === 'intercepted' || retryReason === 'malformed_protocol'
+          : (retryReason === 'intercepted' || retryReason === 'malformed_protocol' || retryReason === 'thought_tool_call'
             ? buildAgentRetryHint(retryReason)
             : buildToolErrorRetryHint(toolErrors, allowedToolNames))));
     // required / missing_tool 优先级高于 intercepted，会把拦截藏在自己后面。
@@ -1262,6 +1361,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // decideRetryReason 闭包持有的是同一个数组引用），否则上一轮的丢弃会把
     // 成功的重试再判成拦截，协议恢复名额被烧光后以 502 收场。
     normalizeDelta.interceptedToolNames.length = 0;
+    // 判定输入按轮清零（thinkingContent 本身继续累计 —— 响应交付语义不动）。
+    attemptThinkingContent = '';
     upstreamFinishReason = null;
     const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
     upstreamCompleted = retryResult.completed;
@@ -1278,6 +1379,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       .map((call, index) => ({ ...call, index }));
     cleanedText = stripAgentTags(parsedRetry.cleanedText);
     toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
+    // 重试轮的 think phase 同样要定案：晋升或留证据，下一次 decideRetryReason 才看得见。
+    settleThinkPhase();
   }
 
   if (streamBrokeOnRetry) {
@@ -1299,7 +1402,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     const detail = toolErrors.length
       ? describeToolErrors(toolErrors)
       : 'tool_choice=required 未触发任何工具调用';
-    logger.warning?.(
+    // logger 上只有 warn，没有 warning —— 旧的 logger.warning?.() 是静默空操作。
+    logger.warn(
       `Anthropic 非流式工具协议失败，${attemptsMade}/${maxAttempts} 次尝试后放弃 (${detail})`,
       'ANTHROPIC'
     );

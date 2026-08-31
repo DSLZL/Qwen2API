@@ -614,6 +614,41 @@ test('a standalone tool call emitted in the thinking phase remains executable', 
   assert.doesNotMatch(res.output, /<tool_call>/)
 })
 
+// Pin de las guardas de promocion del loop A (evidencia read-only, sin cambio de src):
+// la promocion desde thinking exige cleanedText VACIO — un call flanqueado por prosa
+// de razonamiento es una cita/deliberacion, no una accion. Los loops B y C copian
+// exactamente estas guardas (spec toolcall-salvage-2); si alguien las relaja aqui,
+// este test se pone rojo antes de que la relajacion se propague por paridad.
+test('A-parity pin: a think call flanked by reasoning prose is NOT promoted', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"think","content":"<tool_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{}}</tool_call> but let me weigh it first"},"finish_reason":"stop"}]}\n\n'
+    ]),
+    true,
+    false,
+    { messages: [{ role: 'user', content: 'inspect the repository' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => {
+        retries += 1
+        return {
+          status: true,
+          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"<agent_final>done safely</agent_final>"},"finish_reason":"stop"}]}\n\n'])
+        }
+      }
+    }
+  )
+
+  assert.equal(retries, 1, 'non-empty reasoning cleanedText must block promotion and force a retry')
+  assert.doesNotMatch(res.output, /"tool_calls":\[/, 'the quoted think call must never execute')
+  assert.match(res.output, /done safely/)
+})
+
 test('live reasoning never leaks fragmented tool markup before the Agent gate decides', async () => {
   const res = createMockResponse()
   await handleStreamResponse(

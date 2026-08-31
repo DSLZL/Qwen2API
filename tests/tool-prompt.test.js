@@ -11,6 +11,7 @@ const {
   containsOrphanProtocolResidue,
   isLeakedToolPayloadShape,
   matchToolCallOpening,
+  escapeRawControlCharsInStrings,
   TOOL_CALL_PAYLOAD_WINDOW
 } = require('../src/utils/tool-prompt.js')
 
@@ -412,6 +413,9 @@ test('lockstep: prompt, historia y hints de reintento ensenan el mismo marcador'
     // (intercepted) o de que el protocolo salio escrito a medias (malformed_protocol).
     agentTurn.buildAgentRetryHint('intercepted'),
     agentTurn.buildAgentRetryHint('malformed_protocol'),
+    // La razon nueva del leak en think phase re-ensena el marcador igual que sus
+    // hermanas de recuperacion de protocolo.
+    agentTurn.buildAgentRetryHint('thought_tool_call'),
     buildToolSystemPrompt([{ type: 'function', function: { name: 'read_file', description: 'x', parameters: { type: 'object', properties: {} } } }])
   ]) {
     assert.ok(text.includes(agentTurn.TOOL_CALL_OPEN), 'no ensena el marcador canonico')
@@ -1255,4 +1259,103 @@ test('P12: closers duplicados en forma angular se tragan (entero, streamed y par
   visible += parser.flush().textDelta
   assert.equal(calls.length, 1)
   assert.equal(visible, 'despues', 'el duplicado angular partido en el chunk se filtro')
+})
+
+// ── Reparacion de control chars crudos en strings JSON (spec toolcall-salvage-2) ──
+// Verificado en vivo 2026-08-31 13:36: payloads de answer phase morian con
+// invalid_json "Bad control character in string literal" — newlines crudos dentro
+// de un string JSON, una falla determinista y reparable del modelo. La reparacion
+// corre SOLO despues de que el parse estricto falla, se limita a escapar C0 crudos
+// dentro de literales de string, y jamas puede alterar un payload que el parse
+// estricto acepta.
+
+test('reparacion: un payload con \\n y \\t crudos dentro de un string se vuelve una llamada', () => {
+  const raw = '[TOOL CALL]\n{"name":"write_file","arguments":{"path":"a.md","content":"line1\nline2\tend"}}\n[END TOOL CALL]'
+  const result = parseToolCallsFromText(raw, { allowedToolNames: ['write_file'] })
+  assert.equal(result.errors.length, 0, 'el payload reparable no debe registrar error')
+  assert.equal(result.toolCalls.length, 1)
+  const args = JSON.parse(result.toolCalls[0].function.arguments)
+  assert.equal(args.content, 'line1\nline2\tend', 'los control chars deben sobrevivir como caracteres reales')
+})
+
+test('reparacion: tambien via el stream parser (misma buildToolCallPayload compartida)', () => {
+  const raw = '[TOOL CALL]{"name":"write_file","arguments":{"content":"a\nb"}}[END TOOL CALL]'
+  const parser = createToolCallStreamParser({ allowedToolNames: ['write_file'] })
+  const calls = []
+  for (const ch of raw) calls.push(...parser.push(ch).completedCalls)
+  calls.push(...parser.flush().completedCalls)
+  assert.equal(calls.length, 1)
+  assert.equal(JSON.parse(calls[0].function.arguments).content, 'a\nb')
+})
+
+test('reparacion: otros C0 se escapan en forma \\uXXXX', () => {
+  const raw = '[TOOL CALL]{"name":"read_file","arguments":{"a":"x\x01y"}}[END TOOL CALL]'
+  const result = parseToolCallsFromText(raw, { allowedToolNames: ['read_file'] })
+  assert.equal(result.toolCalls.length, 1)
+  assert.equal(JSON.parse(result.toolCalls[0].function.arguments).a, 'x\x01y')
+})
+
+test('reparacion: JSON valido es punto fijo — la reparacion no corre ni altera nada', () => {
+  // Escapes legales que un state machine ingenuo rompe: \\n literal, comilla escapada,
+  // backslash escapado al final de un string.
+  const valid = '{"name":"read_file","arguments":{"path":"a\\nb","note":"quote \\" and backslash \\\\"}}'
+  assert.equal(escapeRawControlCharsInStrings(valid), null, 'sin C0 crudos no hay nada que reparar (null)')
+  const result = parseToolCallsFromText(`[TOOL CALL]${valid}[END TOOL CALL]`, { allowedToolNames: ['read_file'] })
+  assert.equal(result.toolCalls.length, 1)
+  const args = JSON.parse(result.toolCalls[0].function.arguments)
+  assert.equal(args.path, 'a\nb')
+  assert.equal(args.note, 'quote " and backslash \\')
+})
+
+test('reparacion: newlines crudos FUERA de strings no se tocan (whitespace legal)', () => {
+  const valid = '{"name":"read_file",\n"arguments":{}}'
+  assert.equal(escapeRawControlCharsInStrings(valid), null, 'whitespace estructural no es reparacion')
+})
+
+test('reparacion: un payload roto mas alla de control chars sigue siendo invalid_json', () => {
+  // El \n crudo se repara, pero la coma colgante no: sin dependencias lenient,
+  // sin reparaciones semanticamente riesgosas.
+  const raw = '[TOOL CALL]\n{"name":"read_file","arguments":{"a":"b\nc",}}\n[END TOOL CALL]'
+  const result = parseToolCallsFromText(raw, { allowedToolNames: ['read_file'] })
+  assert.equal(result.toolCalls.length, 0)
+  assert.equal(result.errors[0].type, 'invalid_json')
+  // El reason preservado es el del parse ESTRICTO original (el control char), no el
+  // del re-parse reparado: esto pinea el orden estricto-primero — si la reparacion
+  // corriera antes, el mensaje seria el de la coma colgante.
+  assert.match(String(result.errors[0].reason), /control character/i)
+})
+
+test('reparacion: loguea una sola linea de tipo, jamas el contenido del payload', () => {
+  const { logger } = require('../src/utils/logger.js')
+  const saved = logger.warn
+  const lines = []
+  logger.warn = (msg) => { lines.push(String(msg)) }
+  try {
+    parseToolCallsFromText(
+      '[TOOL CALL]{"name":"read_file","arguments":{"secret":"tok\nen-123"}}[END TOOL CALL]',
+      { allowedToolNames: ['read_file'] }
+    )
+  } finally {
+    logger.warn = saved
+  }
+  const repairLines = lines.filter(l => /负载修复/.test(l))
+  assert.equal(repairLines.length, 1, `expected exactly one repair line, got:\n${lines.join('\n')}`)
+  assert.doesNotMatch(repairLines[0], /tok/, 'el contenido del payload se filtro al log')
+  assert.doesNotMatch(repairLines[0], /en-123/, 'el contenido del payload se filtro al log')
+})
+
+test('reparacion: JSON valido no emite linea de reparacion', () => {
+  const { logger } = require('../src/utils/logger.js')
+  const saved = logger.warn
+  const lines = []
+  logger.warn = (msg) => { lines.push(String(msg)) }
+  try {
+    parseToolCallsFromText(
+      '[TOOL CALL]{"name":"read_file","arguments":{"path":"a"}}[END TOOL CALL]',
+      { allowedToolNames: ['read_file'] }
+    )
+  } finally {
+    logger.warn = saved
+  }
+  assert.equal(lines.filter(l => /负载修复/.test(l)).length, 0, 'la reparacion corrio sobre JSON valido')
 })

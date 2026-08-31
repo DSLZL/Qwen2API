@@ -433,6 +433,63 @@ const firstNonEmptyString = (...values) =>
   values.find(value => typeof value === 'string' && value.length > 0) || null;
 
 /**
+ * 控制字符修复：把 JSON **字符串字面量内部**的裸 C0 控制字符转义掉。
+ *
+ * 实测（2026-08-31 13:36）：模型把多行文本原样塞进 arguments 的字符串里 —— 裸换行、
+ * 裸制表符 —— 严格解析当场死于 "Bad control character in string literal"。这是一类
+ * 确定性、可修复的模型故障：字符串里的裸 C0 在合法 JSON 中**不可能**出现，转义它
+ * 不存在语义歧义。修复严格限于这一类 —— 单引号、尾随逗号、Python 常量一概不修
+ * （没有语料证据，且有语义风险；也绝不引入 jsonrepair 之类的宽松解析依赖）。
+ *
+ * 只在严格 JSON.parse 失败之后调用（buildToolCallPayload 的 catch 里）：合法负载
+ * 永远不经过这里，构造上就不可能被改动。字符游走的状态机与 extractBalancedObject
+ * 同一套纪律：尊重反斜杠转义，只在 inString 状态下动手。
+ * @param {string} jsonText - 严格解析失败的 JSON 文本
+ * @returns {string|null} 修复后的文本；没有任何可修复字符时返回 null
+ */
+const escapeRawControlCharsInStrings = (jsonText) => {
+  const text = String(jsonText);
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let repaired = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        out += char;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        out += char;
+        continue;
+      }
+      if (char === '"') {
+        inString = false;
+        out += char;
+        continue;
+      }
+      const code = char.charCodeAt(0);
+      if (code <= 0x1f) {
+        repaired = true;
+        if (char === '\n') out += '\\n';
+        else if (char === '\r') out += '\\r';
+        else if (char === '\t') out += '\\t';
+        else out += `\\u${code.toString(16).padStart(4, '0')}`;
+        continue;
+      }
+      out += char;
+      continue;
+    }
+    if (char === '"') inString = true;
+    out += char;
+  }
+  return repaired ? out : null;
+};
+
+/**
  * 把窗口里取到的 JSON 变成 { name, arguments }。
  *
  * 工具名**只能**来自负载的 name 键。曾经允许从触发器尾巴上取名字（`<tool_call read_file>`），
@@ -450,7 +507,23 @@ const buildToolCallPayload = (jsonText) => {
   try {
     parsed = JSON.parse(jsonText);
   } catch (error) {
-    return { error: { type: 'invalid_json', raw: jsonText, reason: error?.message } };
+    // 修复只在严格解析失败之后运行，且仅限字符串内的裸控制字符（见
+    // escapeRawControlCharsInStrings）。修复日志只登记类型，绝不带负载内容 ——
+    // Node 24 的 e.message 会把负载片段嵌进去，负载可能携带凭据。
+    const repairedText = escapeRawControlCharsInStrings(jsonText);
+    if (repairedText !== null) {
+      try {
+        parsed = JSON.parse(repairedText);
+      } catch (_) {
+        parsed = undefined;
+      }
+      if (parsed !== undefined) {
+        warnTool('tool_call 负载修复：严格解析失败后转义字符串内的裸控制字符，重新解析成功');
+      }
+    }
+    if (parsed === undefined) {
+      return { error: { type: 'invalid_json', raw: jsonText, reason: error?.message } };
+    }
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { error: { type: 'invalid_json', raw: jsonText, reason: 'not an object' } };
@@ -1425,5 +1498,7 @@ module.exports = {
   isLeakedToolPayloadShape,
   matchToolCallOpening,
   normalizeAllowedToolNames,
-  serializeToolArguments
+  serializeToolArguments,
+  // 控制字符修复导出仅供测试钉住"合法 JSON 是不动点"的不变式。
+  escapeRawControlCharsInStrings
 };

@@ -828,7 +828,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 ? buildRequiredRetryHint(toolChoice)
                 : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
             const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
-            logger.warning?.(
+            logger.warn(
                 needsRequiredRetry
                     ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
                     : (needsMissingToolRetry
@@ -1171,7 +1171,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 ? buildRequiredRetryHint(toolChoice)
                 : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
             const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
-            logger.warning?.(
+            logger.warn(
                 needsRequiredRetry
                     ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
                     : (needsMissingToolRetry
