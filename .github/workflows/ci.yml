@@ -29,3 +29,8 @@ jobs:
       # lint results.
       - run: npm run lint
       - run: npm test
+        env:
+          # src/config calls process.exit(1) at require time when API_KEY is
+          # unset, killing the five suites that load controllers. The value
+          # itself is never read by any test.
+          API_KEY: ci-test-key
