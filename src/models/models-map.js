@@ -1,7 +1,7 @@
 const axios = require('axios')
 const accountManager = require('../utils/account.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
 const { generateUUID } = require('../utils/tools.js')
 const { buildRequestHeaders } = require('../utils/header-profile')
 const { logger } = require('../utils/logger')

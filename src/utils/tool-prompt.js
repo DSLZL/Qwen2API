@@ -885,7 +885,6 @@ const createToolCallStreamParser = (options = {}) => {
     for (;;) {
       if (inToolCall) {
         afterTrigger += buffer;
-        buffer = '';
         const leftover = resolveTriggered(result, flushing);
         if (leftover === null) return;
         buffer = leftover;
@@ -893,7 +892,6 @@ const createToolCallStreamParser = (options = {}) => {
       }
 
       pendingText += buffer;
-      buffer = '';
       if (!pendingText) return;
 
       const match = pendingText.match(TOOL_CALL_TRIGGER_RE);

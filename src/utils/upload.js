@@ -181,7 +181,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
         if (error.response?.status === 403) {
             logger.error('403 Forbidden错误，可能是Token权限问题', 'UPLOAD')
             logger.error('认证失败，请检查Token权限', 'UPLOAD')
-            throw new Error('认证失败，请检查Token权限')
+            throw new Error('认证失败，请检查Token权限', { cause: error })
         }
 
         // 重试逻辑

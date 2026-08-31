@@ -592,8 +592,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let promptTokens = 0;
   let completionTokens = 0;
   let upstreamFinishReason = null;
-  let upstreamCompleted = false;
-  let upstreamEventCount = 0;
+  let upstreamCompleted;
+  let upstreamEventCount;
   let visibleText = '';
 
   // 每个 attempt 都必须拿到全新的解析器。旧代码只建一次，于是补偿重试会继承上一轮的
@@ -820,8 +820,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let currentUpstream = upstream;
   let attemptsMade = 0;
   let retriedAfterVisibleText = false;
-  let nativeToolCalls = [];
-  let hasEmittedToolCalls = false;
+  let nativeToolCalls;
+  let hasEmittedToolCalls;
 
   for (;;) {
     attemptsMade += 1;
@@ -999,8 +999,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let completionTokens = 0;
   let webSearchInfo = null;
   let upstreamFinishReason = null;
-  let upstreamCompleted = false;
-  let upstreamEventCount = 0;
+  let upstreamCompleted;
+  let upstreamEventCount;
   let nativeToolAccumulator = hasTools
     ? createNativeToolCallAccumulator({ allowedToolNames })
     : null;
@@ -1121,7 +1121,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
           ? buildEmptyOutputRetryHint()
           : buildToolErrorRetryHint(toolErrors, allowedToolNames)));
 
-    let retryResp = null;
+    let retryResp;
     try {
       retryResp = await sendRequest(appendRetryHint(requestBody, hint));
     } catch (e) {
@@ -1138,7 +1138,6 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     upstreamFinishReason = null;
     const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
     upstreamCompleted = retryResult.completed;
-    upstreamEventCount = retryResult.eventCount;
     if (!upstreamCompleted && !upstreamFinishReason) {
       streamBrokeOnRetry = true;
       break;
@@ -1220,7 +1219,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     contentBlocks.push({ type: 'text', text: cleanedText });
   }
   for (const call of toolCalls) {
-    let input = {};
+    let input;
     try { input = JSON.parse(call.function.arguments || '{}'); } catch (_) { input = {}; }
     contentBlocks.push({
       type: 'tool_use',

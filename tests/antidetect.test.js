@@ -3,8 +3,7 @@ const assert = require('node:assert/strict')
 
 // --- Unit under test imports ---
 const {
-  generateDeterministicFingerprint,
-  parseFingerprint
+  generateDeterministicFingerprint
 } = require('../src/utils/fingerprint.js')
 
 const {

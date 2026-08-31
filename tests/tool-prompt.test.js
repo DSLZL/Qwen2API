@@ -319,10 +319,9 @@ test('matriz corchetes: un link Markdown [tool calls](url) no dispara una llamad
   // justamente para que streaming y texto-completo NO diverjan en la frontera de chunk
   // entre `]` y `(`. Se comprueba que el parser incremental da el mismo 0.
   const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
-  let visible = ''
   const calls = []
-  for (const ch of md) { const o = parser.push(ch); visible += o.textDelta + o.recoveredText; calls.push(...o.completedCalls) }
-  const tail = parser.flush(); visible += tail.textDelta + tail.recoveredText; calls.push(...tail.completedCalls)
+  for (const ch of md) { const o = parser.push(ch); calls.push(...o.completedCalls) }
+  const tail = parser.flush(); calls.push(...tail.completedCalls)
   assert.equal(calls.length, 0, 'streaming ejecuto el link Markdown como llamada (divergencia)')
 
   // Y la llamada real de la misma forma sigue recuperandose en ambas rutas.
@@ -659,7 +658,6 @@ test('matriz: un payload truncado sigue siendo un error bloqueante recuperable',
   assert.match(tail.recoveredText, /^<tool_call">/)
 })
 
-const BT = String.fromCharCode(96)
 
 const FENCE = '```'
 

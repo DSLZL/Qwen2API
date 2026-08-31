@@ -8,7 +8,7 @@ const { uploadFileToQwenOss } = require('../utils/upload.js')
 const { parserModel } = require('../utils/chat-helpers.js')
 const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
 const { buildRequestHeaders } = require('../utils/header-profile')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
@@ -253,7 +253,7 @@ const extractResponseIDsFromText = (text) => {
     ]
 
     for (const pattern of patterns) {
-        let matched = null
+        let matched
         while ((matched = pattern.exec(text)) !== null) {
             const responseID = matched[1]?.trim()
             if (responseID && !responseIDs.includes(responseID)) {
@@ -511,13 +511,6 @@ const extractVideoTaskIdentifiersFromPayload = (payload) => {
 
     return taskIDs
 }
-
-/**
- * 从上游响应中提取首个视频任务 ID
- * @param {*} payload - 上游响应负载
- * @returns {string|null} 视频任务 ID
- */
-const extractVideoTaskIDFromPayload = (payload) => extractVideoTaskIdentifiersFromPayload(payload)[0] || null
 
 /**
  * 判断是否属于可重试的上游生成错误
@@ -1697,130 +1690,6 @@ const handleOpenAIVideoGeneration = async (req, res) => {
     }
 }
 
-const handleVideoCompletion = async (res, responseStream, token, model, downstreamStream, chatID) => {
-    let keepAliveTimer = null
-
-    try {
-        if (downstreamStream) {
-            setResponseHeaders(res, true)
-            keepAliveTimer = setInterval(() => {
-                if (!res.writableEnded) {
-                    res.write(`: keep-alive\n\n`)
-                }
-            }, 15000)
-        }
-
-        const { upstreamError, contentUrl: upstreamContentUrl, videoTaskID, videoTaskCandidates, responseIDs, rawPreview } = await readVideoUpstreamResult(responseStream)
-        if (upstreamError) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            if (downstreamStream) {
-                res.status(upstreamError.status || 500)
-                return returnResponse(res, model, upstreamError.error || '视频生成失败', true)
-            }
-
-            return sendUpstreamError(res, upstreamError)
-        }
-
-        if (upstreamContentUrl) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            return returnResponse(res, model, buildVideoContent(upstreamContentUrl), downstreamStream)
-        }
-
-        let resolvedContentUrl = upstreamContentUrl
-        let resolvedTaskCandidates = [...videoTaskCandidates]
-
-        if (!resolvedContentUrl && resolvedTaskCandidates.length === 0 && chatID) {
-            logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
-
-            for (let attempt = 1; attempt <= 5; attempt++) {
-                const chatDetail = await getChatDetail(chatID, token)
-                const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
-
-                if (!resolvedContentUrl && extractedInfo.contentUrl) {
-                    resolvedContentUrl = extractedInfo.contentUrl
-                }
-
-                for (const taskID of extractedInfo.videoTaskCandidates) {
-                    if (!resolvedTaskCandidates.includes(taskID)) {
-                        resolvedTaskCandidates.push(taskID)
-                    }
-                }
-
-                if (resolvedContentUrl || resolvedTaskCandidates.length > 0) {
-                    break
-                }
-
-                await sleep(1200)
-            }
-        }
-
-        if (resolvedContentUrl) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            return returnResponse(res, model, buildVideoContent(resolvedContentUrl), downstreamStream)
-        }
-
-        if (resolvedTaskCandidates.length === 0) {
-            logger.warn(`视频上游响应未解析出任务信息，contentUrl=${resolvedContentUrl || '空'} candidates=${JSON.stringify(resolvedTaskCandidates)} responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
-            throw new Error('上游未返回视频任务 ID 或视频链接')
-        }
-
-        logger.info(`视频任务候选ID: ${JSON.stringify(resolvedTaskCandidates)}`, 'CHAT')
-
-        const maxAttempts = 60
-        const delay = 20 * 1000
-
-        for (const taskCandidate of resolvedTaskCandidates) {
-            logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
-
-            for (let i = 0; i < maxAttempts; i++) {
-                const content = await getVideoTaskStatus(taskCandidate, token)
-                if (content) {
-                    if (keepAliveTimer) {
-                        clearInterval(keepAliveTimer)
-                    }
-
-                    return returnResponse(res, model, buildVideoContent(content), downstreamStream)
-                }
-
-                await sleep(delay)
-            }
-        }
-
-        logger.error(`视频任务 ${JSON.stringify(resolvedTaskCandidates)} 轮询超时`, 'CHAT')
-        if (keepAliveTimer) {
-            clearInterval(keepAliveTimer)
-        }
-
-        if (downstreamStream) {
-            return returnResponse(res, model, '视频生成超时，请稍后再试', true)
-        }
-
-        return res.status(504).json({ error: '视频生成超时，请稍后再试' })
-    } catch (error) {
-        if (keepAliveTimer) {
-            clearInterval(keepAliveTimer)
-        }
-
-        logger.error('获取视频任务状态失败', 'CHAT', '', error)
-
-        const errorMessage = error.response?.data?.data?.code || error.message || '可能该帐号今日生成次数已用完'
-
-        if (downstreamStream) {
-            return returnResponse(res, model, `视频生成失败: ${errorMessage}`, true)
-        }
-
-        res.status(500).json({ error: errorMessage })
-    }
-}
 
 const getVideoTaskStatus = async (videoTaskID, token) => {
     try {
