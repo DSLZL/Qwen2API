@@ -68,7 +68,10 @@ const TOOL_RESULT_CLOSE = '[END TOOL RESULT]';
 // （isMarkdownLinkTail），那时两条路径都已经拿到了触发器到负载之间的完整 tail。
 const TOOL_CALL_TRIGGER_RE = /<[ \t]{0,4}tool_calls?|\[[ \t]{0,4}tool[ \t_-]{1,2}calls?/i;
 
-/** 触发器到负载之间允许的最大间隔。实测中位数 3、最大 49；128 之外再放宽也救不回更多。 */
+// 触发器到负载之间允许的最大间隔。中位数 3、最大 49、128 上界 —— 这些数字全部量自
+// **尖括号**语料（149 段抓包），方括号形式还没有对应的语料。沿用是合理默认：方括号是
+// 我们自己教给模型、要求写干净的形式，装饰理应更少而不是更多。真要偏离，得先抓一批
+// [TOOL CALL] 的真实输出再调，别凭感觉动这个 128。
 const TOOL_CALL_PAYLOAD_WINDOW = 128;
 
 /** 触发器能匹配到的最长文本，用作 chunk 边界暂存区的上界。取两种形式里更长的那个。 */
@@ -94,10 +97,18 @@ const TOOL_CALL_CLOSE_BARE_RE = /^<[ \t]{0,4}\/[ \t]{0,4}tool_calls?/i;
 // 与尖括号闭标签同一条纪律：只用来吞掉、有上界、多词散文匹配不上。
 // `[TOOL RESULT: …]` 既没有 END 也没有 '/'，按构造匹配不上 —— 模型伪造的结果块
 // 不会被当成闭标记吃掉。
+// 装饰段同时排除 '[' 和 ']'：consumeTrailingCloser 的 grow 判据把内部的 '['
+// 当成"这段永远成不了闭标记"的证据（`!slice.includes('[', 1)`），正则这一半也必须认同，
+// 否则 `[END TOOL CALL[[[]` 在正则里算闭标记、在 grow 判据里不算，两半自相矛盾。
 const TOOL_CALL_CLOSE_BRACKET_RE =
-  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s\]]{0,16}[ \t\r\n]{0,4}\]/i;
+  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}[ \t\r\n]{0,4}\]/i;
 const TOOL_CALL_CLOSE_BRACKET_BARE_RE =
   /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?/i;
+// 上界是两种闭标记里更长的那个。两个都是手写的镜像字面量，必须和上面的正则**用眼睛**保持
+// 同步 —— 这是这种写法的固有风险。当前方括号臂（63）其实盖过尖括号臂（58），而方括号闭标记
+// 最长也就 42 个字符，本来就落在任一臂之下；也就是说方括号那个字面量此刻是冗余的安全垫，
+// 就算它写短了也咬不出 bug（除非有人把两个臂同时改短到 42 以下）。真要收紧成一个精确不变式，
+// 得把常量导出、在测试里断言"正则匹配长度 ≤ MAX"。
 const TOOL_CALL_CLOSE_MAX = Math.max(
   '</    tool_calls'.length + 42,
   '[    END  TOOL  CALLS'.length + 42
@@ -489,7 +500,6 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '- A tool call must be the first non-whitespace content of the visible answer. Do not write “I will…”, “Let me…”, “我将…”, “正在…”, a plan, or a completion claim before it.',
     `- The JSON inside \`${TOOL_CALL_OPEN}\` must be valid and on a single logical block.`,
     `- Write the opening marker as exactly \`${TOOL_CALL_OPEN}\` and the closing marker as exactly \`${TOOL_CALL_CLOSE}\`, each on its own line. They never take attributes, an id, or the tool name — everything the call needs is inside the JSON.`,
-    '- Never write these markers as XML-style angle-bracket tags. That form is reserved by the platform and gets intercepted before the tools ever run.',
     '- Use the exact tool name listed above.',
     '- Provide all required arguments; omit unknown ones.',
     `- You may emit multiple \`${TOOL_CALL_OPEN}\` blocks back-to-back when more than one tool is needed.`,

@@ -337,6 +337,35 @@ test('matriz corchetes: un "[TOOL CA" suelto lo libera flush, no se lo traga', (
   assert.equal(parser.flush().textDelta, '[TOOL CA')
 })
 
+// Cobertura conductual del cierre decorado hasta el limite de la clase ({0,16}): debe
+// consumirse entero, no filtrarse. (No pincha la desincronizacion del literal-espejo de
+// corchetes en TOOL_CALL_CLOSE_MAX: ese literal esta dominado por el piso de la forma
+// angular — 58 chars — y el cierre de corchetes mas largo posible son 42, asi que siempre
+// cabe. La nota esta junto a la constante.)
+test('matriz corchetes: un cierre decorado al limite del regex se consume entero', () => {
+  const closer = `[END TOOL CALL${'x'.repeat(16)}]` // 16 = limite de la clase de decoracion
+  const text = `[TOOL CALL]\n{"name":"read_file","arguments":{"path":"a"}}\n${closer}`
+  const result = parseToolCallsFromText(text, { allowedToolNames: ['read_file'] })
+  assert.equal(result.toolCalls.length, 1, 'la llamada no se recupero')
+  assert.equal(result.cleanedText, '', 'el cierre decorado se filtro al texto visible (MAX desincronizado)')
+})
+
+// Cierre bare al final del stream (`…[END TOOL CALL`, sin el `]`): la disciplina del cierre
+// angular se construyo justo alrededor de este caso (`</tool_call` sin `>`); la forma de
+// corchetes tiene el mismo path (TOOL_CALL_CLOSE_BRACKET_BARE_RE) pero no lo cubria ningun test.
+// (Un truncamiento MAS agresivo, `[END TOOL` sin la palabra CALL, se filtra a proposito —
+// igual que `</tool_c` en la forma angular; el bare regex exige las palabras completas.)
+test('matriz corchetes: un cierre bare al final del stream se consume, no se filtra', () => {
+  const text = '[TOOL CALL]\n{"name":"read_file","arguments":{"path":"a"}}\n[END TOOL CALL'
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  let visible = ''
+  const calls = []
+  for (const ch of text) { const o = parser.push(ch); visible += o.textDelta + o.recoveredText; calls.push(...o.completedCalls) }
+  const tail = parser.flush(); visible += tail.textDelta + tail.recoveredText; calls.push(...tail.completedCalls)
+  assert.equal(calls.length, 1, 'la llamada no se recupero')
+  assert.equal(visible, '', 'el cierre bare se filtro como texto visible')
+})
+
 test('matriz corchetes: el cuerpo de un resultado no puede abrir una llamada', () => {
   // El trigger es case-insensitive, asi que el cuerpo hostil DEBE traer variantes
   // en mayuscula/mixto: un neutralizador que solo desarma minusculas deja `<TOOL_CALL>`
