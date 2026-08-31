@@ -13,16 +13,18 @@ const {
 // 换分隔符的完整理由（Qwen 平台拦截原生 <tool_call>）也写在那里。
 
 /**
- * 工具**结果**的分隔符。刻意和调用标签长得完全不一样。
+ * 工具**结果**的分隔符。
  *
- * 旧的是 `<tool_response tool_call_id="…" name="…">`：和 `<tool_call` 共享前缀，还是个
- * 带属性的 HTML 元素。模型每一轮都能看见它，于是把它的形状学到调用标签上 ——
- * 实测到的坏标签正好是这几种拼法的产物：
- *   <tool_call_id_1>              ← tool_call + tool_call_id="<id>"
- *   <tool_call name="read_file">  ← <tool_name> 占位符被当成属性
- *   <tool_call_result>            ← tool_call + <tool_response>
- *   <tool_call style="…">         ← 干脆当成一个 HTML 元素
- * 换成不带尖括号、不带属性、也不以 tool_ 开头的行标记，就没有可以被搬运的形状了。
+ * 历史：最早是 `<tool_response tool_call_id="…" name="…">` —— 和当时的调用标签 `<tool_call`
+ * 共享前缀，还是个带属性的 HTML 元素，模型每一轮都能看见它，于是把它的形状学到调用标签上，
+ * 产出 `<tool_call_id_1>`、`<tool_call name="read_file">`、`<tool_call_result>` 这一族坏标签。
+ * 于是结果标记先改成了不带尖括号、不带属性的行标记 `[TOOL RESULT: …]`。
+ *
+ * 现在调用标记也是方括号行标记 `[TOOL CALL]`（为躲开 Qwen 平台对原生 `<tool_call>` 的拦截，
+ * 见 agent-turn.js）。两者因此**共享 `[TOOL ` 前缀**，不再"完全不一样"。这不会造成解析冲突：
+ * 调用触发器认的是 `tool[ _-]call`，结果标记是 `TOOL RESULT`，关键词不同，互不交叉匹配；
+ * 名字又只能来自负载。残留的是模型可能把两者拼混（`[TOOL CALL RESULT]`），但拼出来的东西
+ * 要么命中调用触发器（照常从负载恢复），要么谁都不命中（当正文放行），风险远低于当年那一族。
  */
 const TOOL_RESULT_OPEN = '[TOOL RESULT: ';
 const TOOL_RESULT_CLOSE = '[END TOOL RESULT]';
@@ -59,6 +61,11 @@ const TOOL_RESULT_CLOSE = '[END TOOL RESULT]';
  */
 // 两个头都认：方括号是规范形式，尖括号是模型 RL 惯性下仍可能吐出的旧原生形式。
 // 旧形式被平台拦截时我们本来就收不到；漏网的那些照旧回收。
+//
+// 这里**不**用否定环视去甩掉 `[tool calls](url)` 这类 Markdown 链接：环视要往后看几十个字符，
+// 而流式解析器在 chunk 边界上看到的是半截 `[tool calls]`（'(' 还没到），环视据此提前放行，
+// 于是整段和流式两条路径对同一输入给出不同结果 —— 分歧比误报本身更糟。改为在**定界点**判断
+// （isMarkdownLinkTail），那时两条路径都已经拿到了触发器到负载之间的完整 tail。
 const TOOL_CALL_TRIGGER_RE = /<[ \t]{0,4}tool_calls?|\[[ \t]{0,4}tool[ \t_-]{1,2}calls?/i;
 
 /** 触发器到负载之间允许的最大间隔。实测中位数 3、最大 49；128 之外再放宽也救不回更多。 */
@@ -187,6 +194,17 @@ const extractBalancedObject = (text, start) => {
   }
   return null;
 };
+
+/**
+ * 触发器到负载之间的 tail 若长成 Markdown 链接的收尾（`](`），这就不是调用而是链接：
+ * `[tool calls](https://…) … {json}`。真正的方括号调用 `[TOOL CALL]\n{…}` 的 tail 是 `]\n`，
+ * 不含 `](`。只对方括号触发器判断（尖括号形式不会撞上 Markdown 链接语法）。
+ * @param {string} triggerText 触发器原文（用来区分方括号 / 尖括号形式）
+ * @param {string} tail 触发器结尾到负载 '{' 之间的文本
+ * @returns {boolean}
+ */
+const isMarkdownLinkTail = (triggerText, tail) =>
+  triggerText.charAt(0) === '[' && /\]\(/.test(tail);
 
 /**
  * 触发器之后、窗口之内第一个 '{' 的下标。
@@ -574,7 +592,9 @@ const neutraliseResultMarkers = (value) => String(value)
   // 触发器正则（与之锁步）就永远匹配不上。
   .replace(/\[(?=[ \t]{0,4}tool[ \t_-]{1,2}calls?)/gi, '(')
   .replace(/\[(?=[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?)/gi, '(')
-  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/g, '(');
+  // i 标志不可省：TOOL_CALL_TRIGGER_RE 的尖括号臂是 case-insensitive，缺 i 时
+  // `<TOOL_CALL>` 从不可信正文里原样漏过，被模型引用到回答开头就能点火调起工具。
+  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/gi, '(');
 
 /**
  * 结果标记占一整行，工具名里不能出现会把它撑破的字符
@@ -647,6 +667,12 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     if (payloadAt < 0) {
       // 触发了却什么都凑不出来。以前这里完全无声，问题因此一直看不见。
       suppress('no payload in window', logTriggeredUnrecovered);
+      continue;
+    }
+
+    // `[tool calls](url) … {json}`：方括号触发器后面接的是 Markdown 链接收尾，不是调用。
+    if (isMarkdownLinkTail(match[0], fullText.slice(afterTrigger, payloadAt))) {
+      suppress('markdown link, not a call', logTriggerSuppressed);
       continue;
     }
 
@@ -781,6 +807,11 @@ const createToolCallStreamParser = (options = {}) => {
     const payloadAt = findPayloadStart(afterTrigger, 0, !flushing);
     if (payloadAt === -2) return null;
     if (payloadAt === -1) return suppress('no payload in window', logTriggeredUnrecovered);
+
+    // tail 已经完整缓冲（在 '{' 之前），两条路径同一判断：Markdown 链接收尾不是调用。
+    if (isMarkdownLinkTail(triggerText, afterTrigger.slice(0, payloadAt))) {
+      return suppress('markdown link, not a call', logTriggerSuppressed);
+    }
 
     const object = extractBalancedObject(afterTrigger, payloadAt);
     if (!object) {
