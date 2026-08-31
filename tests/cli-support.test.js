@@ -113,3 +113,38 @@ test('getCliAvailability maps every unavailability reason', () => {
   assert.equal(cliSupport.getCliAvailability({ cli_info: null }), 'pending');
   assert.equal(cliSupport.getCliAvailability({ cli_info: { request_number: 1 } }), 'available');
 });
+
+// Regression: `chatBaseUrl` used to be declared inside the try, so the catch's
+// log line threw a ReferenceError that masked the real authorization failure
+// and turned the promise into a rejection instead of `false`.
+test('authorizeLogin returns false and logs the URL when authorization fails', async () => {
+  const { logger } = require('../src/utils/logger');
+  const originalFetch = global.fetch;
+  const originalError = logger.error;
+
+  const logged = [];
+  logger.error = (...args) => { logged.push(args); };
+
+  try {
+    global.fetch = async () => ({
+      ok: false,
+      status: 403,
+      statusText: 'Forbidden',
+      headers: new Map([['content-type', 'text/plain']]),
+      text: async () => 'denied'
+    });
+    const onNonOk = await cliManager.authorizeLogin('user-code', 'token');
+    assert.equal(onNonOk, false);
+
+    global.fetch = async () => { throw new Error('network down'); };
+    const onThrow = await cliManager.authorizeLogin('user-code', 'token');
+    assert.equal(onThrow, false);
+
+    const urlLogs = logged.filter(args =>
+      args.some(a => a && typeof a === 'object' && String(a.url || '').includes('/api/v2/oauth2/authorize')));
+    assert.equal(urlLogs.length, 2);
+  } finally {
+    global.fetch = originalFetch;
+    logger.error = originalError;
+  }
+});
