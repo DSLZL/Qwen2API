@@ -388,6 +388,26 @@ const looksLikeUnexecutedToolAction = (value) => {
   return english.test(text) || chinese.test(text);
 };
 
+// 协议残渣检测：模型把方括号协议写坏时（孤儿 [END TOOL CALL] 闭标记，或答案
+// 开头直接是 {"name":…,"arguments":…} 负载而没有开触发器），没有触发器可点火，
+// 整段泄漏为可见正文、零调用、零重试 —— 实测 2026-08-31 客户端原样显示了泄漏。
+// 这只是**重试信号**：名字只能来自触发器后面的负载这条边界规则不受影响，
+// 泄漏的 JSON 永远不会被执行。
+// 闭标记扫描复用上面的有界正则，仅去掉行首锚点以便在整段文本中查找。
+const TOOL_CALL_CLOSE_BRACKET_SCAN_RE = new RegExp(TOOL_CALL_CLOSE_BRACKET_RE.source.replace(/^\^/, ''), 'i');
+const LEAKED_PAYLOAD_NAME_RE = /"name"\s*:/;
+const LEAKED_PAYLOAD_ARGS_RE = /"arguments"\s*:/;
+const containsOrphanProtocolResidue = (value) => {
+  const text = String(value || '');
+  if (TOOL_CALL_CLOSE_BRACKET_SCAN_RE.test(text)) return true;
+  // 形状收紧到"泄漏的调用负载"：开头就是 JSON 对象且同时带 name 和 arguments
+  // 两个键，普通的 JSON 答案（缺任一键）不会误伤。
+  const trimmed = text.trimStart();
+  return trimmed.startsWith('{') &&
+    LEAKED_PAYLOAD_NAME_RE.test(trimmed) &&
+    LEAKED_PAYLOAD_ARGS_RE.test(trimmed);
+};
+
 const createToolCallObject = (payload, index = 0, id = null) => ({
   index,
   id: id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
@@ -1041,5 +1061,6 @@ module.exports = {
   createToolCallStreamParser,
   createNativeToolCallAccumulator,
   looksLikeUnexecutedToolAction,
+  containsOrphanProtocolResidue,
   serializeToolArguments
 };

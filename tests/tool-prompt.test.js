@@ -404,9 +404,11 @@ test('lockstep: prompt, historia y hints de reintento ensenan el mismo marcador'
   for (const text of [
     agentTurn.buildAgentTurnDirective(),
     agentTurn.buildAgentRetryHint('invalid_tool_call'),
-    // El hint de interceptacion re-ensena el marcador en el momento mas critico:
-    // justo despues de que la plataforma se comio la forma nativa.
+    // Los hints de recuperacion de protocolo re-ensenan el marcador en el momento
+    // mas critico: justo despues de que la plataforma se comio la forma nativa
+    // (intercepted) o de que el protocolo salio escrito a medias (malformed_protocol).
     agentTurn.buildAgentRetryHint('intercepted'),
+    agentTurn.buildAgentRetryHint('malformed_protocol'),
     buildToolSystemPrompt([{ type: 'function', function: { name: 'read_file', description: 'x', parameters: { type: 'object', properties: {} } } }])
   ]) {
     assert.ok(text.includes(agentTurn.TOOL_CALL_OPEN), 'no ensena el marcador canonico')

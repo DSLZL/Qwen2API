@@ -10,6 +10,7 @@ const {
   createToolCallStreamParser,
   createNativeToolCallAccumulator,
   looksLikeUnexecutedToolAction,
+  containsOrphanProtocolResidue,
   TOOL_CALL_OPEN,
   TOOL_CALL_CLOSE
 } = require('../utils/tool-prompt.js');
@@ -802,8 +803,17 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     if (currentToolErrors().length > 0) return 'tool_error';
     // 平台把模型的原生工具调用吃掉时，我们收到的只剩 role:function 丢弃帧和一段
     // 叙述失败的散文。丢弃帧就是拦截的现场证据：有丢弃、零工具调用、且本请求
-    // 确实带工具 → 值得用规范标记提示模型重发一次。
-    if (hasTools && normalizeDelta.interceptedToolNames.length > 0) return 'intercepted';
+    // 确实带工具 → 值得用规范标记提示模型重发一次。终止性 finish（length/
+    // content_filter/refusal）与 missing_tool/empty 同一纪律：不重试。
+    if (hasTools && normalizeDelta.interceptedToolNames.length > 0 && !terminalFinish()) {
+      return 'intercepted';
+    }
+    // 同族防御：模型把方括号协议写坏（孤儿闭标记 / 开头裸负载），没有触发器可
+    // 点火，整段泄漏为可见正文。只是重试信号，泄漏的 JSON 永远不执行。
+    // intercepted 在前——丢弃帧是更强的证据。
+    if (hasTools && containsOrphanProtocolResidue(visibleText) && !terminalFinish()) {
+      return 'malformed_protocol';
+    }
     if (hasTools && looksLikeUnexecutedToolAction(visibleText) && !terminalFinish()) {
       return 'missing_tool';
     }
@@ -812,11 +822,20 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   };
 
   const retryHintFor = (reason) => {
-    if (reason === 'required') return buildRetryHint(toolChoice);
-    if (reason === 'missing_tool') return buildMissingToolRetryHint();
-    if (reason === 'empty') return buildEmptyOutputRetryHint();
-    if (reason === 'intercepted') return buildAgentRetryHint('intercepted');
-    return buildToolErrorRetryHint(currentToolErrors(), allowedToolNames);
+    let hint;
+    if (reason === 'required') hint = buildRetryHint(toolChoice);
+    else if (reason === 'missing_tool') hint = buildMissingToolRetryHint();
+    else if (reason === 'empty') hint = buildEmptyOutputRetryHint();
+    else if (reason === 'intercepted') hint = buildAgentRetryHint('intercepted');
+    else if (reason === 'malformed_protocol') hint = buildAgentRetryHint('malformed_protocol');
+    else hint = buildToolErrorRetryHint(currentToolErrors(), allowedToolNames);
+    // required / missing_tool 优先级高于 intercepted，会把拦截藏在自己后面。
+    // 不动优先级、不动上限——只让提示词把关键事实带上：调用没到客户端。
+    if ((reason === 'required' || reason === 'missing_tool') &&
+        normalizeDelta.interceptedToolNames.length > 0) {
+      hint = `${hint}\n${buildAgentRetryHint('intercepted')}`;
+    }
+    return hint;
   };
 
   const config = require('../config/index.js');
@@ -825,7 +844,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let currentUpstream = upstream;
   let attemptsMade = 0;
   let retriedAfterVisibleText = false;
-  let interceptionRetried = false;
+  let protocolRecoveryRetried = false;
   let nativeToolCalls;
   let hasEmittedToolCalls;
 
@@ -864,10 +883,23 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     const retryReason = decideRetryReason(hasEmittedToolCalls);
     if (!retryReason || attemptsMade >= maxAttempts) break;
 
-    // 拦截重试整个请求只允许一次：第二次拦截说明提示没被采纳，继续循环只会把更多
-    // 叙述散文拼进客户端的流。原样交付比死循环好。注意这个上限独立于下面的
-    // 已见正文守卫 —— 无叙述的拦截（零可见正文）也必须停在一次。
-    if (retryReason === 'intercepted' && interceptionRetried) break;
+    // 协议恢复重试（intercepted 与 malformed_protocol 共享同一个名额）整个请求
+    // 只允许一次：第二次说明提示没被采纳，继续循环只会把更多叙述散文拼进客户端
+    // 的流。原样交付比死循环好。两个理由绝不能叠成两次额外重试。注意这个上限
+    // 独立于下面的已见正文守卫 —— 无叙述的拦截（零可见正文）也必须停在一次。
+    // 放弃时必须留日志：生产环境要能区分"提示被采纳、回合恢复"和"第二次、
+    // 原样交付"。
+    const isProtocolRecovery = retryReason === 'intercepted' || retryReason === 'malformed_protocol';
+    if (isProtocolRecovery && protocolRecoveryRetried) {
+      const giveUpDrops = normalizeDelta.interceptedToolNames.length > 0
+        ? ` (dropped: ${normalizeDelta.interceptedToolNames.join(', ')})`
+        : '';
+      logger.warn(
+        `Anthropic Agent 协议恢复重试已用完，第二次 ${retryReason} 按原样交付${giveUpDrops}`,
+        'ANTHROPIC'
+      );
+      break;
+    }
 
     // 本控制器是边收边发的：正文一产生就写进客户端的流（OpenAI 路径把裸正文扣在门禁
     // 内，所以它可以随便重试）。因此一旦写过正文，再重试就会把两段输出拼在一起。
@@ -879,20 +911,25 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       // tool_error 是唯一一种"这一轮本身就是垃圾"的拒绝理由：模型复述工具协议时，
       // 回显里的字面标签必然解析失败。此时重试只会把第二轮拼在已经发出去的第一轮
       // 后面，客户端看到同一段垃圾两遍。required / missing_tool 不受影响。
-      // intercepted 消费的正是这一次"已见正文后的补偿"名额：叙述已经streamed出去，
-      // 但迟到的 tool_use 仍然胜过一个死掉的会话。
+      // intercepted / malformed_protocol 消费的正是这一次"已见正文后的补偿"名额：
+      // 叙述（或泄漏的协议残渣）已经流出去了，但迟到的 tool_use 仍然胜过一个
+      // 死掉的会话。
+      //
+      // 已知局限（有测试钉住）：如果这个名额先被别的理由（如 missing_tool）用掉，
+      // 之后一轮带叙述的拦截就无法重试 —— 按原样交付收场。
       if (retryReason === 'tool_error') break;
       if (retriedAfterVisibleText) break;
       retriedAfterVisibleText = true;
     }
-    if (retryReason === 'intercepted') interceptionRetried = true;
+    if (isProtocolRecovery) protocolRecoveryRetried = true;
 
-    // intercepted 的日志必须带上被丢弃的名字：生产环境里这行紧跟着一串
-    // UPSTREAM_NORMALIZER 丢弃日志出现，是验证这条防御真的触发的唯一抓手。
-    const rejectionDetail = retryReason === 'intercepted'
+    // 有丢弃帧时任何拒绝理由都带上名字：required/tool_error 优先级更高时拦截会被
+    // 盖住，但生产环境里这行紧跟着一串 UPSTREAM_NORMALIZER 丢弃日志出现，是验证
+    // 拦截确实发生的唯一抓手。
+    const rejectionDetail = normalizeDelta.interceptedToolNames.length > 0
       ? `${retryReason}; dropped: ${normalizeDelta.interceptedToolNames.join(', ')}`
       : retryReason;
-    logger.warning?.(
+    logger.warn(
       `Anthropic Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${rejectionDetail})`,
       'ANTHROPIC'
     );
@@ -1112,8 +1149,16 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 纠正的错误：把允许的名字摆在模型面前即可。
     if (toolErrors.length > 0) return 'tool_error';
     // 与流式分支同一条防御：role:function 丢弃帧 + 零工具调用 + 本请求带工具，
-    // 说明平台吃掉了模型的原生调用，用规范标记提示重发一次。
-    if (hasTools && normalizeDelta.interceptedToolNames.length > 0) return 'intercepted';
+    // 说明平台吃掉了模型的原生调用，用规范标记提示重发一次。终止性 finish 不重试
+    // —— 与 missing_tool/empty 同一纪律。
+    if (hasTools && normalizeDelta.interceptedToolNames.length > 0 && !terminalFinish()) {
+      return 'intercepted';
+    }
+    // 同族防御：方括号协议写坏（孤儿闭标记 / 开头裸负载）整段泄漏为可见正文。
+    // 只是重试信号，泄漏的 JSON 永远不执行。intercepted 在前——丢弃帧是更强的证据。
+    if (hasTools && containsOrphanProtocolResidue(cleanedText) && !terminalFinish()) {
+      return 'malformed_protocol';
+    }
     if (hasTools && looksLikeUnexecutedToolAction(cleanedText) && !terminalFinish()) {
       return 'missing_tool';
     }
@@ -1125,37 +1170,64 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const maxAttempts = Math.max(1, Number(config.agentTurnMaxAttempts) || 1);
   let attemptsMade = 1;
   let streamBrokeOnRetry = false;
-  let interceptionRetried = false;
+  let protocolRecoveryRetried = false;
+  // finding 2：拦截重试会用重试轮的解析结果整体替换 cleanedText。若重试轮空手
+  // 而归，绝不能拿 502 换掉已经拿到的叙述 —— 留底，收尾时兜底交付（同流式分支
+  // "迟到的叙述胜过死掉的会话"的精神）。
+  let narrationFallback = '';
 
   while (attemptsMade < maxAttempts) {
     const retryReason = decideRetryReason();
     if (!retryReason) break;
 
-    // 与流式分支同一条纪律：拦截重试整个请求只允许一次。第二次拦截说明提示
-    // 没被采纳，把叙述散文按正常回答交付，别再烧尝试次数。
-    if (retryReason === 'intercepted') {
-      if (interceptionRetried) break;
-      interceptionRetried = true;
+    // 与流式分支同一条纪律：协议恢复重试（intercepted / malformed_protocol 共享
+    // 同一个名额）整个请求只允许一次。第二次说明提示没被采纳，把叙述散文按正常
+    // 回答交付，别再烧尝试次数。放弃时留日志：生产环境要能区分"提示被采纳、
+    // 回合恢复"和"第二次、原样交付"。
+    const isProtocolRecovery = retryReason === 'intercepted' || retryReason === 'malformed_protocol';
+    if (isProtocolRecovery) {
+      if (protocolRecoveryRetried) {
+        const giveUpDrops = normalizeDelta.interceptedToolNames.length > 0
+          ? ` (dropped: ${normalizeDelta.interceptedToolNames.join(', ')})`
+          : '';
+        logger.warn(
+          `Anthropic 非流式 Agent 协议恢复重试已用完，第二次 ${retryReason} 按原样交付${giveUpDrops}`,
+          'ANTHROPIC'
+        );
+        break;
+      }
+      protocolRecoveryRetried = true;
     }
 
-    // intercepted 带上被丢弃的名字（同流式分支：生产环境验证防御触发的抓手）。
-    const rejectionDetail = retryReason === 'intercepted'
+    // 有丢弃帧时任何拒绝理由都带上名字：required/tool_error 优先级更高时拦截会
+    // 被盖住，这行日志是生产环境验证拦截确实发生的抓手。
+    const rejectionDetail = normalizeDelta.interceptedToolNames.length > 0
       ? `${retryReason}; dropped: ${normalizeDelta.interceptedToolNames.join(', ')}`
       : retryReason;
-    logger.warning?.(
+    logger.warn(
       `Anthropic 非流式 Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${rejectionDetail})`,
       'ANTHROPIC'
     );
 
-    const hint = retryReason === 'required'
+    let hint = retryReason === 'required'
       ? buildRetryHint(toolChoice)
       : (retryReason === 'missing_tool'
         ? buildMissingToolRetryHint()
         : (retryReason === 'empty'
           ? buildEmptyOutputRetryHint()
-          : (retryReason === 'intercepted'
-            ? buildAgentRetryHint('intercepted')
+          : (retryReason === 'intercepted' || retryReason === 'malformed_protocol'
+            ? buildAgentRetryHint(retryReason)
             : buildToolErrorRetryHint(toolErrors, allowedToolNames))));
+    // required / missing_tool 优先级高于 intercepted，会把拦截藏在自己后面。
+    // 不动优先级、不动上限——只让提示词把关键事实带上：调用没到客户端。
+    if ((retryReason === 'required' || retryReason === 'missing_tool') &&
+        normalizeDelta.interceptedToolNames.length > 0) {
+      hint = `${hint}\n${buildAgentRetryHint('intercepted')}`;
+    }
+
+    if (retryReason === 'intercepted' && cleanedText.trim()) {
+      narrationFallback = cleanedText;
+    }
 
     let retryResp;
     try {
@@ -1171,8 +1243,12 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     const before = answerContent;
     // 每轮全新的累加器，否则上一轮的错误会一直跟着走。
     nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames });
-    // normalizeDelta 在本分支是跨 attempt 共享的（已知缺陷，unify-agent-loop 规格
-    // 负责修）。拦截计数必须按轮归零，否则上一轮的丢弃会把成功的重试再判成拦截。
+    // normalizeDelta 在本分支是跨 attempt 共享的 —— 这本身是个已知缺陷（流式分支
+    // 每轮新建；统一两个循环的计划在 lohari 仓库
+    // _bmad-output/implementation-artifacts/spec-qwen2api-unify-agent-loop.md）。
+    // 在那之前：拦截计数必须按轮**就地**归零（length = 0，不能重新赋值 ——
+    // decideRetryReason 闭包持有的是同一个数组引用），否则上一轮的丢弃会把
+    // 成功的重试再判成拦截，协议恢复名额被烧光后以 502 收场。
     normalizeDelta.interceptedToolNames.length = 0;
     upstreamFinishReason = null;
     const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
@@ -1197,6 +1273,12 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       type: 'error',
       error: { type: 'api_error', message: '工具调用重试流在结束标记前断开' }
     });
+  }
+
+  // finding 2：拦截重试之后的轮次两手空空时，交还拦截那一轮的叙述，而不是 502。
+  // 客户端拿到"工具好像坏了"的叙述还能继续对话；拿到 502 这回合就死了。
+  if (toolCalls.length === 0 && !cleanedText.trim() && narrationFallback) {
+    cleanedText = narrationFallback;
   }
 
   if (hasTools && toolCalls.length === 0 && (toolErrors.length > 0 || requiresToolCall(toolChoice))) {

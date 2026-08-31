@@ -1202,3 +1202,160 @@ test('an echoed <tool_call> in accepted reasoning reaches the client whole', asy
   assert.match(res.output, /block next time\./, 'la frase llegó cortada en el tag')
   assert.doesNotMatch(res.output, /upstream_agent|invalid_tool_call/)
 })
+
+// ── Defensa de recuperacion de protocolo en la ruta OpenAI (findings 9 y 10) ──
+// La interceptacion de plataforma (drops role:function) y el protocolo de brackets
+// escrito a medias (residuo huerfano / payload pelado) mataban el turno tambien en
+// /v1/chat/completions: el gate aceptaba la narracion envuelta en <agent_final>
+// como completacion legitima. Ahora ambos son razones de retry con tope compartido.
+
+const { runOpenAIAgentTurn } = require('../src/utils/openai-agent-runtime.js')
+
+const agentAnswerFrame = (content) => `data: ${JSON.stringify({
+  choices: [{ delta: { phase: 'answer', content }, finish_reason: null }]
+})}\n\n`
+const agentInterceptionFrame = (name) => `data: ${JSON.stringify({
+  choices: [{
+    delta: { role: 'function', phase: 'answer', name, content: `Tool ${name} does not exists` },
+    finish_reason: null
+  }]
+})}\n\n`
+const agentTurnStream = (...frames) => Readable.from([
+  ...frames,
+  'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+])
+
+const WRAPPED_NARRATION = '<agent_final>The Bash tool seems unavailable, giving up on the task.</agent_final>'
+const AGENT_BRACKET_CALL = '[TOOL CALL]{"name":"read_file","arguments":{"path":"a.txt"}}[END TOOL CALL]'
+// Leak real #2 (2026-08-31): JSON completo y valido al inicio, closers doblados.
+const AGENT_LEAK = [
+  '{"name": "AskUserQuestion", "arguments": {"questions": [{"question": "Deploy to which environment?", "header": "Env", "options": [{"label": "dev", "description": "staging first"}, {"label": "prod", "description": "straight to production"}], "multiSelect": false}]}}',
+  '[END TOOL CALL]',
+  '[END TOOL CALL]'
+].join('\n')
+
+const runAgentTurn = (initialFrames, sendChatRequest, overrides = {}) => runOpenAIAgentTurn(
+  agentTurnStream(...initialFrames),
+  {
+    has_tools: true,
+    tool_choice: 'auto',
+    allowed_tool_names: ['read_file'],
+    agent_turn_max_attempts: 3,
+    upstream_request_body: { messages: [{ role: 'user', content: 'do the task' }] },
+    sendChatRequest,
+    ...overrides
+  }
+)
+
+test('OpenAI gate: la narracion envuelta tras drops se rechaza como intercepted, no se acepta', () => {
+  const attempt = buildAttempt({
+    controlKind: 'final',
+    visibleText: 'The Bash tool seems unavailable, giving up.',
+    interceptedToolNames: ['Bash']
+  })
+  assert.deepEqual(evaluateAgentTurn(attempt), {
+    accepted: false,
+    finishReason: null,
+    retryReason: 'intercepted'
+  })
+  // Nombre agotado el tope compartido: se entrega por las reglas de siempre.
+  assert.equal(evaluateAgentTurn(attempt, { protocol_recovery_used: true }).accepted, true)
+  // Sin herramientas en juego, los drops no significan nada.
+  assert.equal(evaluateAgentTurn(attempt, { has_tools: false }).accepted, true)
+})
+
+test('OpenAI gate: drops junto a una llamada aceptada no reintenta (drop especulativo benigno)', () => {
+  const attempt = buildAttempt({
+    toolCalls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{}' } }],
+    interceptedToolNames: ['Bash']
+  })
+  assert.deepEqual(evaluateAgentTurn(attempt), {
+    accepted: true,
+    finishReason: 'tool_calls',
+    retryReason: null
+  })
+})
+
+test('OpenAI gate: el leak de protocolo malformado se rechaza; JSON ordinario no', () => {
+  assert.equal(
+    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: AGENT_LEAK })).retryReason,
+    'malformed_protocol'
+  )
+  // JSON sin clave "arguments" al inicio: respuesta normal, cae en bare.
+  assert.equal(
+    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '{"name": "results", "count": 3}' })).retryReason,
+    'bare'
+  )
+})
+
+test('OpenAI loop: turno interceptado reintenta una vez con el hint canonico y recupera', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(result.attempt.toolCalls[0].function.name, 'read_file')
+  assert.equal(sent.length, 1)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /did not reach the client/)
+  assert.ok(hint.includes('[TOOL CALL]'), 'el hint debe ensenar el marcador canonico')
+  assert.doesNotMatch(hint, /<tool_call/i)
+})
+
+test('OpenAI loop: la segunda interceptacion entrega el final envuelto tal cual (tope de uno)', async () => {
+  let sent = 0
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async () => {
+      sent += 1
+      return {
+        status: true,
+        response: agentTurnStream(agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION))
+      }
+    }
+  )
+
+  assert.equal(sent, 1, 'exactamente un retry de recuperacion de protocolo por request')
+  assert.equal(result.ok, true, 'entregar tal cual, no agotar con 429')
+  assert.equal(result.finishReason, 'stop')
+  assert.match(result.attempt.visibleText, /unavailable/)
+})
+
+test('OpenAI loop: el leak malformado reintenta con su hint y recupera tool_calls', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentAnswerFrame(AGENT_LEAK)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(sent.length, 1)
+  assert.match(JSON.stringify(sent[0]), /was NOT executed/)
+})
+
+test('OpenAI loop: required_tool tapa la interceptacion pero el hint lleva el dato clave', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('Bash'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    },
+    { tool_choice: 'required' }
+  )
+
+  assert.equal(result.ok, true)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /violated tool_choice/, 'la razon elegida sigue siendo required_tool')
+  assert.match(hint, /did not reach the client/, 'el dato de la interceptacion no puede perderse')
+})

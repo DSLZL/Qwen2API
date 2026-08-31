@@ -510,8 +510,16 @@ const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
 /**
  * 创建上游 delta 归一化器：将 thinking_summary 的 extra.summary_thought 增量转为 phase=think 的 content
  * summary 帧为增长数组，只 emit 新增段落，避免重复。
+ *
+ * 返回的函数带一个 `.interceptedToolNames` 属性（string[]）：每丢弃一帧
+ * role:function 就记一个去重后的名字（上限 {@link INTERCEPTED_NAMES_CAP}，防止
+ * 多帧注入无限增长）。这是平台拦截原生工具调用的现场证据，Anthropic/OpenAI 的
+ * Agent 循环靠它决定 intercepted 重试。消费者只能**就地清空**
+ * （`arr.length = 0`），绝不能重新赋值 —— 非流式循环的按轮重置正依赖同一个
+ * 数组引用。
  * @returns {(delta: object) => ({ phase: string, content: string }|null)}
  */
+const INTERCEPTED_NAMES_CAP = 20
 const createUpstreamDeltaNormalizer = () => {
     let summaryThoughtCount = 0
     const normalize = (delta) => {
@@ -523,9 +531,13 @@ const createUpstreamDeltaNormalizer = () => {
         // injection. The dropped names are the live evidence of that interception,
         // so surface them for retry decisions instead of only logging.
         if (delta.role === 'function') {
-            normalize.interceptedToolNames.push(delta.name || 'unknown')
+            const interceptedName = delta.name || 'unknown'
+            if (normalize.interceptedToolNames.length < INTERCEPTED_NAMES_CAP &&
+                !normalize.interceptedToolNames.includes(interceptedName)) {
+                normalize.interceptedToolNames.push(interceptedName)
+            }
             logger.warn(
-                `Dropped upstream role:function delta with phase "${delta.phase}" and name "${delta.name || 'unknown'}"`,
+                `Dropped upstream role:function delta with phase "${delta.phase}" and name "${interceptedName}"`,
                 'UPSTREAM_NORMALIZER'
             )
             return null
@@ -561,8 +573,8 @@ const createUpstreamDeltaNormalizer = () => {
             content
         }
     }
-    // 附着在归一化函数上的拦截信号：每丢一帧 role:function 就记一个名字。
-    // 调用签名不变——不读这个属性的消费者完全不受影响。
+    // 附着在归一化函数上的拦截信号（见上方 JSDoc）。调用签名不变——
+    // 不读这个属性的消费者完全不受影响。
     normalize.interceptedToolNames = []
     return normalize
 }

@@ -14,6 +14,20 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 
 const { handleAnthropicStream, handleAnthropicNonStream } = require('../src/controllers/anthropic.js');
+const { logger } = require('../src/utils/logger.js');
+
+/** Spy sobre logger.warn (el metodo REAL — logger.warning no existe en el singleton). */
+const captureWarns = async (fn) => {
+  const saved = logger.warn;
+  const lines = [];
+  logger.warn = (message) => { lines.push(String(message)); };
+  try {
+    await fn();
+  } finally {
+    logger.warn = saved;
+  }
+  return lines;
+};
 
 const createMockStreamResponse = () => ({
   output: '',
@@ -79,6 +93,24 @@ const turnOf = (...frames) => () => Readable.from([...frames, STOP]);
 // pasaria desapercibida.
 const NARRATION = 'The Bash tool seems unavailable in this environment, so the task cannot continue.';
 const BRACKET_CALL = '[TOOL CALL]{"name":"read_file","arguments":{"path":"a.txt"}}[END TOOL CALL]';
+
+// Leak real #1 (sesion del usuario, 2026-08-31): payload + closer, SIN opener.
+// Probable mecanica: el modelo emitio el opener nativo por habito RL, la plataforma
+// se lo comio server-side, y el resto se filtro como texto visible.
+const LEAK_PAYLOAD_CLOSER = [
+  '{"name": "Bash", "arguments": {"command": "find . -type f 2>/dev/null", "description": "Check existing bmad-output docs"}}',
+  '[END TOOL CALL]',
+  '{"name": "Bash", "arguments": {"command": "ls"}}',
+  '[END TOOL CALL]'
+].join('\n');
+
+// Leak real #2: JSON COMPLETO y valido al inicio de la respuesta (arrays/objetos
+// anidados) y closers DOBLADOS. La deteccion (b) debe disparar exactamente aqui.
+const LEAK_VALID_JSON_DOUBLE_CLOSER = [
+  '{"name": "AskUserQuestion", "arguments": {"questions": [{"question": "Deploy to which environment?", "header": "Env", "options": [{"label": "dev", "description": "staging first"}, {"label": "prod", "description": "straight to production"}], "multiSelect": false}]}}',
+  '[END TOOL CALL]',
+  '[END TOOL CALL]'
+].join('\n');
 
 const scriptedSender = (...turns) => {
   const queue = [...turns];
@@ -211,5 +243,195 @@ describe('interception-aware retry (non-stream)', () => {
     const text = (res.body?.content || []).filter(block => block.type === 'text').map(block => block.text).join('');
     assert.match(text, /unavailable/, 'the narration is the answer the client gets');
     assert.equal(res.body.stop_reason, 'end_turn');
+  });
+
+  it('an empty retry after interception delivers the narration, never a 502 (finding 2)', async () => {
+    // attempt 1 = drops + narracion → retry de interceptacion; attempt 2 = vacio.
+    // El rebuild del retry descarta el cleanedText del attempt 1; sin el fallback,
+    // el handler caia en el 502 de "!cleanedText.trim()" y cambiaba narracion por error.
+    const sender = scriptedSender(turnOf());
+    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+
+    assert.equal(res.statusCode, 200, 'the narration must beat a 502');
+    const text = (res.body?.content || []).filter(block => block.type === 'text').map(block => block.text).join('');
+    assert.match(text, /unavailable/, 'the intercepted attempt narration is the fallback answer');
+    assert.equal(res.body.stop_reason, 'end_turn');
+    assert.equal(sender.calls.length, 2, 'interception retry + the empty-reason retry that failed');
+  });
+
+  it('the per-attempt drop reset lets later retries succeed (finding 7)', async () => {
+    // turn 1 = interceptacion + narracion, turn 2 = vacio, turn 3 = bracket call.
+    // Sin la linea `normalizeDelta.interceptedToolNames.length = 0`, los drops del
+    // attempt 1 siguen vivos en el attempt 2 → segunda "interceptacion" fantasma →
+    // el tope corta el loop y la respuesta se degrada (1 retry, sin tool_use).
+    const sender = scriptedSender(turnOf(), turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender);
+
+    assert.equal(sender.calls.length, 2, 'interception retry then empty retry');
+    assert.equal(res.statusCode, 200);
+    const toolBlocks = (res.body?.content || []).filter(block => block.type === 'tool_use');
+    assert.deepEqual(toolBlocks.map(block => block.name), ['read_file']);
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+
+  it('benign speculative drop: an accepted call alongside drops never retries', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runNonStream(turnOf(interceptionFrame('Bash'), answerFrame(BRACKET_CALL)), sender);
+
+    assert.equal(sender.calls.length, 0);
+    const toolBlocks = (res.body?.content || []).filter(block => block.type === 'tool_use');
+    assert.deepEqual(toolBlocks.map(block => block.name), ['read_file']);
+  });
+
+  it('no tools in play: drops on a prose-only request never retry', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('unused')));
+    const res = await runNonStream(
+      turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)),
+      sender,
+      { hasTools: false, allowedToolNames: [] }
+    );
+
+    assert.equal(sender.calls.length, 0);
+    assert.equal(res.statusCode, 200);
+    const text = (res.body?.content || []).filter(block => block.type === 'text').map(block => block.text).join('');
+    assert.match(text, /unavailable/);
+  });
+});
+
+describe('interception observability (finding 3)', () => {
+  it('a masking reason still logs the dropped names', async () => {
+    // tool_choice=required gana el slot de razon, pero el log DEBE decir que ademas
+    // hubo drops: en produccion esa linea junto al burst de UPSTREAM_NORMALIZER es
+    // la unica evidencia de que la interceptacion ocurrio bajo otra razon.
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    let hint;
+    const warns = await captureWarns(async () => {
+      await runStream(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)), sender, { toolChoice: 'required' });
+      hint = JSON.stringify(sender.calls[0]);
+    });
+
+    assert.ok(
+      warns.some(line => /required; dropped: Bash/.test(line)),
+      `expected a "required; dropped: Bash" warn, got:\n${warns.join('\n')}`
+    );
+    // finding 4 para la razon required: el hint lleva el dato clave ademas del suyo.
+    assert.match(hint, /You did not call any tool/);
+    assert.match(hint, /did not reach the client/);
+  });
+
+  it('the give-up on a second interception is logged with the names', async () => {
+    const sender = scriptedSender(turnOf(interceptionFrame('Bash')), turnOf(interceptionFrame('Bash')));
+    const warns = await captureWarns(async () => {
+      await runStream(turnOf(interceptionFrame('Bash')), sender);
+    });
+
+    assert.equal(sender.calls.length, 1);
+    assert.ok(
+      warns.some(line => /协议恢复重试已用完/.test(line) && /dropped: Bash/.test(line)),
+      `expected a give-up warn with the dropped names, got:\n${warns.join('\n')}`
+    );
+  });
+});
+
+describe('intercepted outranks missing_tool (finding 4)', () => {
+  it('action-flavored narration after an interception still gets the intercepted hint', async () => {
+    // "I'll run..." matchea looksLikeUnexecutedToolAction. Con el orden correcto la
+    // razon es intercepted y el hint es SOLO el canonico; con el orden invertido la
+    // razon seria missing_tool y su texto base ("described an action") apareceria en
+    // el hint (via el append enmascarado) — esta prueba falla bajo ese swap.
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runStream(
+      turnOf(interceptionFrame('Bash'), answerFrame("I'll run the Bash command again.")),
+      sender
+    );
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /did not reach the client/);
+    assert.doesNotMatch(hint, /described an action/, 'missing_tool won the slot: precedence regressed');
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+  });
+});
+
+describe('documented limitation: the after-prose allowance is shared (finding 8)', () => {
+  it('a prior prose retry exhausts the allowance a later interception needs', async () => {
+    // attempt 1: prosa missing_tool consume retriedAfterVisibleText → retry 1.
+    // attempt 2: interceptacion + narracion — el tope compartido de protocolo esta
+    // libre, pero la guarda de texto-ya-enviado corta el loop → entrega tal cual.
+    const sender = scriptedSender(turnOf(interceptionFrame('Bash'), answerFrame(NARRATION)));
+    const res = await runStream(turnOf(answerFrame('I will run the build now.')), sender);
+
+    assert.equal(sender.calls.length, 1, 'only the missing_tool retry fired');
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /described an action/);
+    assert.doesNotMatch(hint, /did not reach the client/, 'no drops existed on attempt 1');
+    assert.match(res.output, /"type":"message_stop"/);
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+});
+
+describe('malformed bracket protocol (finding 10)', () => {
+  it('payload + closer with no opener: retry carries the malformed hint and recovers', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), sender);
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /was NOT executed/, 'must say the call was malformed and not executed');
+    assert.ok(hint.includes('[TOOL CALL]'), 'must teach the canonical opener');
+    assert.doesNotMatch(hint, /<tool_call/i);
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('a complete valid JSON payload with doubled closers also fires (leak sample #2)', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runStream(turnOf(answerFrame(LEAK_VALID_JSON_DOUBLE_CLOSER)), sender);
+
+    assert.equal(sender.calls.length, 1);
+    assert.match(JSON.stringify(sender.calls[0]), /was NOT executed/);
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+  });
+
+  it('an orphan closer alone in prose fires the defense', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runStream(turnOf(answerFrame('I ran the command.\n[END TOOL CALL]')), sender);
+
+    assert.equal(sender.calls.length, 1);
+    assert.match(JSON.stringify(sender.calls[0]), /was NOT executed/);
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+  });
+
+  it('answer-start JSON without an "arguments" key does NOT fire', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('retry would consume this')));
+    const res = await runStream(turnOf(answerFrame('{"name": "results", "count": 3}')), sender);
+
+    assert.equal(sender.calls.length, 0, 'ordinary JSON answers must not be mistaken for leaks');
+    assert.match(res.output, /"type":"message_stop"/);
+  });
+
+  it('intercepted and malformed share ONE recovery slot per request (cap sharing)', async () => {
+    // attempt 1: interceptacion sin narracion (cero texto visible — la guarda de
+    // prosa nunca se activa). attempt 2: leak malformado. Solo el tope COMPARTIDO
+    // puede parar aqui; con topes separados habria un segundo retry.
+    const sender = scriptedSender(
+      turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)),
+      turnOf(answerFrame(BRACKET_CALL))
+    );
+    const res = await runStream(turnOf(interceptionFrame('Bash')), sender);
+
+    assert.equal(sender.calls.length, 1, 'one protocol-recovery retry TOTAL, not one per reason');
+    assert.match(res.output, /"type":"message_stop"/);
+  });
+
+  it('non-stream: the leak shape retries once and recovers tool_use', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runNonStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), sender);
+
+    assert.equal(sender.calls.length, 1);
+    assert.match(JSON.stringify(sender.calls[0]), /was NOT executed/);
+    assert.equal(res.statusCode, 200);
+    const toolBlocks = (res.body?.content || []).filter(block => block.type === 'tool_use');
+    assert.deepEqual(toolBlocks.map(block => block.name), ['read_file']);
   });
 });
