@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node src/start.js",
     "dev": "nodemon src/server.js",
-    "test": "node --test tests/*.test.js",
+    "test": "node --test --test-force-exit tests/*.test.js",
+    "lint": "eslint .",
     "pm2": "pm2 start ecosystem.config.js",
     "pm2:stop": "pm2 stop qwen2api",
     "pm2:restart": "pm2 restart qwen2api",
@@ -37,6 +38,9 @@
     "tiktoken": "^1.0.21"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "globals": "^17.11.0",
     "nodemon": "^3.1.7"
   }
 }
