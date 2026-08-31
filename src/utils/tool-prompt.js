@@ -4,20 +4,13 @@ const {
   AGENT_FINAL_OPEN,
   AGENT_FINAL_CLOSE,
   AGENT_BLOCKED_OPEN,
-  AGENT_BLOCKED_CLOSE
+  AGENT_BLOCKED_CLOSE,
+  TOOL_CALL_OPEN,
+  TOOL_CALL_CLOSE
 } = require('./agent-turn.js');
 
-/**
- * 工具调用 XML 起始标签
- * @type {string}
- */
-const TOOL_CALL_OPEN = '<tool_call>';
-
-/**
- * 工具调用 XML 结束标签
- * @type {string}
- */
-const TOOL_CALL_CLOSE = '</tool_call>';
+// TOOL_CALL_OPEN / TOOL_CALL_CLOSE 从 agent-turn.js 引入：规范标记与重试提示必须锁步，
+// 换分隔符的完整理由（Qwen 平台拦截原生 <tool_call>）也写在那里。
 
 /**
  * 工具**结果**的分隔符。刻意和调用标签长得完全不一样。
@@ -62,15 +55,20 @@ const TOOL_RESULT_CLOSE = '[END TOOL RESULT]';
  * 实测（85 段带触发器的抓包回合）：精确标签 49%；无触发器的自由扫描 90%，但边界和上界
  * 全丢；触发器 + 负载 95%。只有去掉触发器才救得回来的回合：0 段。
  *
- * 只影响**读取**。foldToolMessages 回写历史时仍然使用规范形式 <tool_call>。
+ * 只影响**读取**。foldToolMessages 回写历史时使用规范形式 [TOOL CALL]。
  */
-const TOOL_CALL_TRIGGER_RE = /<[ \t]{0,4}tool_calls?/i;
+// 两个头都认：方括号是规范形式，尖括号是模型 RL 惯性下仍可能吐出的旧原生形式。
+// 旧形式被平台拦截时我们本来就收不到；漏网的那些照旧回收。
+const TOOL_CALL_TRIGGER_RE = /<[ \t]{0,4}tool_calls?|\[[ \t]{0,4}tool[ \t_-]{1,2}calls?/i;
 
 /** 触发器到负载之间允许的最大间隔。实测中位数 3、最大 49；128 之外再放宽也救不回更多。 */
 const TOOL_CALL_PAYLOAD_WINDOW = 128;
 
-/** 触发器能匹配到的最长文本，用作 chunk 边界暂存区的上界。 */
-const TOOL_CALL_TRIGGER_MAX = '<    tool_calls'.length;
+/** 触发器能匹配到的最长文本，用作 chunk 边界暂存区的上界。取两种形式里更长的那个。 */
+const TOOL_CALL_TRIGGER_MAX = Math.max(
+  '<    tool_calls'.length,
+  '[    tool  calls'.length
+);
 
 /**
  * 闭标签同样会被写坏（`</tool_call">`、`</tool_call result>`），而且常和开标签不对称。
@@ -85,7 +83,18 @@ const TOOL_CALL_TRIGGER_MAX = '<    tool_calls'.length;
 const TOOL_CALL_CLOSE_RE =
   /^<[ \t]{0,4}\/[ \t]{0,4}tool_calls?[^\s<>＞]{0,16}[ \t\r\n]{0,4}(?:[A-Za-z_][\w-]{0,15})?[ \t\r\n]{0,4}[>＞]/i;
 const TOOL_CALL_CLOSE_BARE_RE = /^<[ \t]{0,4}\/[ \t]{0,4}tool_calls?/i;
-const TOOL_CALL_CLOSE_MAX = '</    tool_calls'.length + 42;
+// 方括号闭标记：`[END TOOL CALL]` 是规范形式，`[/TOOL CALL]` 是可预期的变体。
+// 与尖括号闭标签同一条纪律：只用来吞掉、有上界、多词散文匹配不上。
+// `[TOOL RESULT: …]` 既没有 END 也没有 '/'，按构造匹配不上 —— 模型伪造的结果块
+// 不会被当成闭标记吃掉。
+const TOOL_CALL_CLOSE_BRACKET_RE =
+  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s\]]{0,16}[ \t\r\n]{0,4}\]/i;
+const TOOL_CALL_CLOSE_BRACKET_BARE_RE =
+  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?/i;
+const TOOL_CALL_CLOSE_MAX = Math.max(
+  '</    tool_calls'.length + 42,
+  '[    END  TOOL  CALLS'.length + 42
+);
 
 /**
  * 触发之后允许缓冲的上限。头部注释说触发器给缓冲区封了顶，但那只对「窗口里找不到负载」
@@ -224,17 +233,20 @@ const consumeTrailingCloser = (text, from, canGrow) => {
   let index = from;
   while (index < text.length && /\s/.test(text[index])) index += 1;
   if (index >= text.length) return { end: from, needMore: !!canGrow };
-  if (text[index] !== '<') return { end: from, needMore: false };
+  const head = text[index];
+  if (head !== '<' && head !== '[') return { end: from, needMore: false };
   const slice = text.slice(index, index + TOOL_CALL_CLOSE_MAX);
-  const match = slice.match(TOOL_CALL_CLOSE_RE);
+  const match = slice.match(head === '<' ? TOOL_CALL_CLOSE_RE : TOOL_CALL_CLOSE_BRACKET_RE);
   if (match) return { end: index + match[0].length, needMore: false };
-  // `</too` 还可能长成一个闭标签，`<div>` 不会。
-  if (canGrow && slice.length < TOOL_CALL_CLOSE_MAX &&
-    !slice.includes('>') && !slice.includes('＞') && !slice.includes('<', 1)) {
+  // `</too` / `[END TO` 还可能长成一个闭标记，`<div>` / `[note]` 不会。
+  const terminator = head === '<'
+    ? (!slice.includes('>') && !slice.includes('＞') && !slice.includes('<', 1))
+    : (!slice.includes(']') && !slice.includes('[', 1));
+  if (canGrow && slice.length < TOOL_CALL_CLOSE_MAX && terminator) {
     return { end: from, needMore: true };
   }
-  // 流已经结束了：光秃秃的 `</tool_call` 后面什么都没有，那它就是闭标签。
-  const bare = slice.match(TOOL_CALL_CLOSE_BARE_RE);
+  // 流已经结束了：光秃秃的 `</tool_call` / `[END TOOL CALL` 后面什么都没有，那它就是闭标记。
+  const bare = slice.match(head === '<' ? TOOL_CALL_CLOSE_BARE_RE : TOOL_CALL_CLOSE_BRACKET_BARE_RE);
   if (!canGrow && bare && !slice.slice(bare[0].length).trim()) {
     return { end: index + slice.length, needMore: false };
   }
@@ -444,9 +456,9 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '## Output format',
     'Emit each tool invocation as:',
     '',
-    '<tool_call>',
+    TOOL_CALL_OPEN,
     '{"name": "<tool_name>", "arguments": {<json_arguments>}}',
-    '</tool_call>',
+    TOOL_CALL_CLOSE,
     '',
     'Tool results come back to you as user messages in this form:',
     '',
@@ -455,16 +467,17 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     TOOL_RESULT_CLOSE,
     '',
     'Rules:',
-    '- If the task requires reading, writing, editing, searching, shell execution, browser use, or any action covered by an available tool, your visible response MUST be a `<tool_call>` block. Call the tool instead of describing the action.',
+    `- If the task requires reading, writing, editing, searching, shell execution, browser use, or any action covered by an available tool, your visible response MUST be a \`${TOOL_CALL_OPEN}\` block. Call the tool instead of describing the action.`,
     '- A tool call must be the first non-whitespace content of the visible answer. Do not write “I will…”, “Let me…”, “我将…”, “正在…”, a plan, or a completion claim before it.',
-    '- The JSON inside `<tool_call>` must be valid and on a single logical block.',
-    '- Write the opening tag as exactly `<tool_call>` and the closing tag as exactly `</tool_call>`. They never take attributes, an id, or the tool name — everything the call needs is inside the JSON.',
+    `- The JSON inside \`${TOOL_CALL_OPEN}\` must be valid and on a single logical block.`,
+    `- Write the opening marker as exactly \`${TOOL_CALL_OPEN}\` and the closing marker as exactly \`${TOOL_CALL_CLOSE}\`, each on its own line. They never take attributes, an id, or the tool name — everything the call needs is inside the JSON.`,
+    '- Never write these markers as XML-style angle-bracket tags. That form is reserved by the platform and gets intercepted before the tools ever run.',
     '- Use the exact tool name listed above.',
     '- Provide all required arguments; omit unknown ones.',
-    '- You may emit multiple `<tool_call>` blocks back-to-back when more than one tool is needed.',
+    `- You may emit multiple \`${TOOL_CALL_OPEN}\` blocks back-to-back when more than one tool is needed.`,
     '- After every tool result, evaluate the actual task state. If work remains, emit the next tool call. Only return a normal-language final answer after the requested task is genuinely complete or you are blocked on user input.',
     '- Never claim that a file was changed, a command succeeded, or a result was verified unless the corresponding tool result proves it.',
-    '- Do not call nonexistent tools, fabricate tool results, wrap `<tool_call>` in code fences, or mix extra commentary into a tool-call turn.',
+    `- Do not call nonexistent tools, fabricate tool results, wrap \`${TOOL_CALL_OPEN}\` in code fences, or mix extra commentary into a tool-call turn.`,
     '- A non-tool response is valid only when it explicitly declares its state: use the completion or blocked wrapper below. Bare prose is invalid.',
     `- Verified completion: ${AGENT_FINAL_OPEN}final report${AGENT_FINAL_CLOSE}`,
     `- Requires user input/authority: ${AGENT_BLOCKED_OPEN}exact blocker${AGENT_BLOCKED_CLOSE}`,
@@ -555,7 +568,13 @@ const foldToolMessages = (messages) => {
  */
 const neutraliseResultMarkers = (value) => String(value)
   .replace(/\[[ \t]*END[ \t]+TOOL[ \t]+RESULT[ \t]*\]/gi, '(END TOOL RESULT)')
-  .replace(/\[[ \t]*TOOL[ \t]+RESULT[ \t]*:/gi, '(TOOL RESULT:');
+  .replace(/\[[ \t]*TOOL[ \t]+RESULT[ \t]*:/gi, '(TOOL RESULT:')
+  // 调用标记同样要在结果正文里失效：不可信内容里的 `[TOOL CALL]` / `<tool_call>`
+  // 一旦被模型原样引用到回答开头，就是一个可以点火的触发器。把头字符换掉，
+  // 触发器正则（与之锁步）就永远匹配不上。
+  .replace(/\[(?=[ \t]{0,4}tool[ \t_-]{1,2}calls?)/gi, '(')
+  .replace(/\[(?=[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?)/gi, '(')
+  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/g, '(');
 
 /**
  * 结果标记占一整行，工具名里不能出现会把它撑破的字符
@@ -719,9 +738,9 @@ const createToolCallStreamParser = (options = {}) => {
    */
   const splitSafeText = (text) => {
     // 触发器可能被切在两个 chunk 中间。宽松匹配无法像字面量那样逐前缀试探，改为按上界暂存：
-    // 从最后一个 '<' 起若不超过一个触发器的长度，就留到下一段再判断。正文里孤立的 '<'
-    // 最多延迟 TOOL_CALL_TRIGGER_MAX 个字符，flush() 兜底放出。
-    const lastOpen = text.lastIndexOf('<');
+    // 从最后一个 '<' 或 '['（两种触发器的头）起若不超过一个触发器的长度，就留到下一段再判断。
+    // 正文里孤立的头字符最多延迟 TOOL_CALL_TRIGGER_MAX 个字符，flush() 兜底放出。
+    const lastOpen = Math.max(text.lastIndexOf('<'), text.lastIndexOf('['));
     if (lastOpen !== -1 && text.length - lastOpen <= TOOL_CALL_TRIGGER_MAX) {
       return { safe: text.slice(0, lastOpen), remainder: text.slice(lastOpen) };
     }

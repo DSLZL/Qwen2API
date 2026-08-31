@@ -3,6 +3,20 @@ const AGENT_FINAL_CLOSE = '</agent_final>'
 const AGENT_BLOCKED_OPEN = '<agent_blocked>'
 const AGENT_BLOCKED_CLOSE = '</agent_blocked>'
 
+// 工具调用的规范标记。定义在这里（依赖图的叶子），tool-prompt.js 和各重试提示共同引用，
+// 保证提示词、折叠回写和重试提示永远教同一种形式。
+//
+// 为什么不是 <tool_call>：那是 Qwen 平台的**原生**格式，而原生意味着平台自己的
+// server-side agent loop 也在盯着它 —— 模型一吐出来就被拦截，拿去查平台自己的
+// tool registry（里面没有我们的工具），然后把 "Tool <name> does not exists" 塞回
+// 模型的生成上下文。模型看到"工具全坏了"，就放弃调用改为口头汇报失败。
+// 实测：2026-08-30 19:56 的会话死亡与 5 条 role:function 拦截逐秒对应，名字正是
+// "Bash"/"Read"；auto_search:false 也关不掉这个拦截器（18/18 探针通过但拦截照发）。
+// 换成平台不认识的标记，拦截器就出局了。旧尖括号形式在读取侧仍然被识别（RL 惯性
+// 输出），只是不再教、不再写 —— 见 tool-prompt.js 的 TOOL_CALL_TRIGGER_RE。
+const TOOL_CALL_OPEN = '[TOOL CALL]'
+const TOOL_CALL_CLOSE = '[END TOOL CALL]'
+
 const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 const unwrapExactTag = (value, openTag, closeTag) => {
@@ -261,7 +275,7 @@ const buildAgentTurnDirective = ({ afterToolResult = false } = {}) => {
     'The client executes tools and automatically sends each tool result back in the next request. Keep that loop alive until the original task is genuinely complete.',
     'Before responding, check the original request, every claimed deliverable, failures in tool results, and whether verification is still missing.',
     'Your entire visible response MUST be exactly one of these modes:',
-    '1. If any action, inspection, edit, command, test, retry, or verification remains: emit one or more valid `<tool_call>...</tool_call>` blocks and no prose.',
+    `1. If any action, inspection, edit, command, test, retry, or verification remains: emit one or more valid \`${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE}\` blocks and no prose.`,
     `2. Only when every requested outcome is complete and supported by tool-result evidence: emit ${AGENT_FINAL_OPEN}a concise final report${AGENT_FINAL_CLOSE}.`,
     `3. Only when progress is impossible without new user input or authority: emit ${AGENT_BLOCKED_OPEN}the exact blocker and required input${AGENT_BLOCKED_CLOSE}.`,
     'Bare prose, a plan, a progress update, hidden reasoning without visible output, or a claim such as “done” without the completion wrapper is an invalid Agent turn and will be regenerated.',
@@ -282,7 +296,7 @@ const buildAgentRetryHint = (reason = 'incomplete') => {
     '# Agent turn recovery',
     reasonText,
     'Continue the SAME original task. Re-check its acceptance criteria and the latest tool result.',
-    `If work remains, output only valid \`<tool_call>...</tool_call>\` blocks. If and only if all work is verified complete, output ${AGENT_FINAL_OPEN}the final report${AGENT_FINAL_CLOSE}.`,
+    `If work remains, output only valid \`${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE}\` blocks. If and only if all work is verified complete, output ${AGENT_FINAL_OPEN}the final report${AGENT_FINAL_CLOSE}.`,
     `If user input is strictly required, output ${AGENT_BLOCKED_OPEN}the blocker${AGENT_BLOCKED_CLOSE}. Do not output bare planning prose.`
   ].join('\n')
 }
@@ -292,6 +306,8 @@ module.exports = {
   AGENT_FINAL_CLOSE,
   AGENT_BLOCKED_OPEN,
   AGENT_BLOCKED_CLOSE,
+  TOOL_CALL_OPEN,
+  TOOL_CALL_CLOSE,
   parseAgentControlText,
   createAgentControlStreamParser,
   createAgentTagStripper,

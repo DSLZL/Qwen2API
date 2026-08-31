@@ -9,7 +9,9 @@ const {
   parseToolCallsFromText,
   createToolCallStreamParser,
   createNativeToolCallAccumulator,
-  looksLikeUnexecutedToolAction
+  looksLikeUnexecutedToolAction,
+  TOOL_CALL_OPEN,
+  TOOL_CALL_CLOSE
 } = require('../utils/tool-prompt.js');
 const { createAgentTagStripper, stripAgentTags, buildAgentRetryHint, buildAgentTurnDirective } = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
@@ -404,20 +406,20 @@ const requiresToolCall = (toolChoice) => {
  */
 const buildRetryHint = (toolChoice) => {
   if (toolChoice && typeof toolChoice === 'object' && toolChoice.function?.name) {
-    return `You did not call any tool. You MUST now call \`${toolChoice.function.name}\` using the <tool_call>...</tool_call> format.`;
+    return `You did not call any tool. You MUST now call \`${toolChoice.function.name}\` using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format.`;
   }
-  return 'You did not call any tool. You MUST now call exactly one tool using the <tool_call>...</tool_call> format.';
+  return `You did not call any tool. You MUST now call exactly one tool using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format.`;
 };
 
 const buildEmptyOutputRetryHint = () => [
   'Your previous reply produced no visible final answer or executable tool call.',
-  'Continue the Agent task now. If any action remains, emit the required `<tool_call>` block immediately with no preamble.',
+  `Continue the Agent task now. If any action remains, emit the required \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
   'Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning.'
 ].join(' ');
 
 const buildMissingToolRetryHint = () => [
   'Your previous reply described an action but did not execute any tool call.',
-  'Perform that action now by emitting the real `<tool_call>` block immediately with no preamble.',
+  `Perform that action now by emitting the real \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
   'Do not describe the action again or claim completion without a tool result.'
 ].join(' ');
 
