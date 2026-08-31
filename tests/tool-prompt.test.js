@@ -1019,17 +1019,240 @@ test('salvage: un payload+closer citado desde un resultado foldeado NUNCA dispar
 test('salvage: el predicado de forma es UNO solo — residuo y apertura sintetica no divergen', () => {
   const payloadShape = '{"name": "x", "arguments": {}}\n[END TOOL CALL]'
   const ordinaryJson = '{"name": "results", "count": 3}'
+  const open = { emittedProse: false, canSalvage: true }
   // Forma de leak: los tres puntos de consumo coinciden.
   assert.equal(isLeakedToolPayloadShape(payloadShape), true)
   assert.equal(containsOrphanProtocolResidue(payloadShape), true)
-  assert.equal(matchToolCallOpening(payloadShape, { emittedProse: false })?.synthetic, true)
+  assert.equal(matchToolCallOpening(payloadShape, open)?.synthetic, true)
   // JSON ordinario: ninguno de los tres lo toma.
   assert.equal(isLeakedToolPayloadShape(ordinaryJson), false)
   assert.equal(containsOrphanProtocolResidue(ordinaryJson), false)
-  assert.equal(matchToolCallOpening(ordinaryJson, { emittedProse: false }), null)
+  assert.equal(matchToolCallOpening(ordinaryJson, open), null)
+  // El predicado esta scoped al objeto LIDER: claves en un payload posterior no
+  // convierten un JSON ordinario en candidato (ni en residuo — sin cerrador huerfano).
+  const jsonThenPayloadKeys = '{"result": "ok"} luego {"name": "x", "arguments": {}}'
+  assert.equal(isLeakedToolPayloadShape(jsonThenPayloadKeys), false)
+  assert.equal(matchToolCallOpening(jsonThenPayloadKeys, open), null)
   // El gate de posicion vive en el matcher, no en el predicado.
-  assert.equal(matchToolCallOpening(payloadShape, { emittedProse: true }), null)
+  assert.equal(matchToolCallOpening(payloadShape, { emittedProse: true, canSalvage: true }), null)
+  // Sin habilitacion explicita el matcher es fail-closed: sin whitelist no hay rescate.
+  assert.equal(matchToolCallOpening(payloadShape, { emittedProse: false }), null)
   // Y el trigger regex sigue teniendo prioridad cuando es el quien abre.
-  const regular = matchToolCallOpening('[TOOL CALL]{"name":"x","arguments":{}}', { emittedProse: false })
+  const regular = matchToolCallOpening('[TOOL CALL]{"name":"x","arguments":{}}', open)
   assert.equal(regular.synthetic, false)
+})
+
+// ---------------------------------------------------------------------------
+// Hallazgos del review adversarial (dispatch P1-P13) — cada gate pinneado.
+// ---------------------------------------------------------------------------
+
+// P1: un candidato sintetico que nunca balancea es un residuo CONSUMIDO, no prosa —
+// se libera como debris hasta el proximo trigger regular y el parseo continua ahi.
+// Tragarse todo hasta el final del texto destruia la llamada valida que seguia.
+test('P1: un candidato que nunca balancea no destruye la llamada regular posterior', () => {
+  const text = '{\n[TOOL CALL]{"name":"read_file","arguments":{"path":"a"}}[END TOOL CALL]'
+  const whole = parseToolCallsFromText(text, { allowedToolNames: ['read_file'] })
+  assert.equal(whole.toolCalls.length, 1, 'la llamada valida murio con el candidato roto')
+  assert.equal(whole.toolCalls[0].function.name, 'read_file')
+  assert.equal(whole.cleanedText, '{', 'el residuo queda visible; el marcado no')
+  assert.doesNotMatch(whole.cleanedText, /TOOL CALL/, 'marcado crudo filtrado al texto')
+
+  const streamed = streamCollect(text, ['read_file'])
+  assert.equal(streamed.calls.length, 1, 'streaming perdio la llamada que sigue al candidato roto')
+  assert.equal(streamed.visible.trim(), whole.cleanedText, 'las dos vias divergen en el texto visible')
+  assert.equal(streamed.recovered, '')
+})
+
+// P2: sin whitelist activa (null o vacia) el gate de nombres es "deja pasar todo" —
+// el rescate NUNCA puede correr bajo esa semantica; fabricaria tool_use sin declarar.
+test('P2: sin whitelist no hay rescate (fail closed); el trigger regular conserva legacy', () => {
+  const leak = '{"name": "Bash", "arguments": {"command": "ls"}}\n[END TOOL CALL]'
+  for (const [label, options] of [['sin opcion', {}], ['lista vacia', { allowedToolNames: [] }]]) {
+    const whole = parseToolCallsFromText(leak, options)
+    assert.equal(whole.toolCalls.length, 0, `${label}: el rescate fabrico un tool_use sin whitelist`)
+    assert.equal(whole.cleanedText, leak, `${label}: el texto debe pasar intacto`)
+
+    const parser = createToolCallStreamParser(options)
+    let visible = ''
+    const calls = []
+    for (const ch of leak) { const o = parser.push(ch); visible += o.textDelta; calls.push(...o.completedCalls) }
+    const tail = parser.flush(); visible += tail.textDelta; calls.push(...tail.completedCalls)
+    assert.equal(calls.length, 0, `${label}: streaming rescato sin whitelist`)
+    assert.equal(visible, leak, `${label}: streaming altero el texto`)
+  }
+  // La semantica legacy del trigger regular no cambia: sin whitelist, todo nombre pasa.
+  const regular = parseToolCallsFromText('[TOOL CALL]{"name":"anything","arguments":{}}[END TOOL CALL]', {})
+  assert.equal(regular.toolCalls.length, 1, 'el gate nuevo se comio la semantica legacy del trigger')
+})
+
+// P3: la razon de un rechazo invalid_json es e.message de JSON.parse — V8 moderno
+// incrusta un fragmento del payload ahi. Ni el log ni warnings[] pueden llevarlo.
+test('P3: el log y las warnings de un rechazo no contienen fragmentos del payload', () => {
+  const { logger } = require('../src/utils/logger.js')
+  const saved = logger.warn
+  const lines = []
+  logger.warn = (message) => { lines.push(String(message)) }
+  let whole
+  try {
+    whole = parseToolCallsFromText(
+      '{"name": SECRETTOKEN123, "arguments": {"key": "SECRETTOKEN123"}}\n[END TOOL CALL]',
+      { allowedToolNames: ['read_file'] }
+    )
+  } finally {
+    logger.warn = saved
+  }
+  assert.equal(whole.toolCalls.length, 0)
+  assert.ok(lines.length > 0, 'el rechazo debe dejar traza en el log')
+  for (const line of lines) {
+    assert.doesNotMatch(line, /SECRETTOKEN123/, 'el log filtro contenido del payload')
+  }
+  const rejection = whole.warnings.find(w => w.type === 'synthetic_rejected')
+  assert.equal(rejection.reason, 'invalid_json', 'la razon registrada debe ser el TIPO, no e.message')
+})
+
+// P4: el "closer bare a fin de stream" debe verificar el resto REAL del texto, no la
+// ventana de 63 chars — un [END TOOL CALL + una pantalla de espacios + prosa no es
+// un cierre, es una violacion de adyacencia.
+test('P4: closer bare + espacios mas alla de la ventana + prosa NO arma la llamada', () => {
+  const text = '{"name": "read_file", "arguments": {"path": "a"}}\n[END TOOL CALL' +
+    ' '.repeat(60) + 'y esta prosa continua'
+  const whole = parseToolCallsFromText(text, { allowedToolNames: ['read_file'] })
+  assert.equal(whole.toolCalls.length, 0, 'la ventana de 63 chars escondio la prosa y armo la llamada')
+  assert.equal(whole.cleanedText, text, 'el texto debe volver entero')
+
+  const streamed = streamCollect(text, ['read_file'])
+  assert.equal(streamed.calls.length, 0, 'streaming armo la llamada con prosa tras la ventana')
+  assert.equal(streamed.visible.trim(), whole.cleanedText)
+})
+
+// P5: esperar el closer obligatorio tambien tiene tope — un upstream que solo emite
+// whitespace no puede retener el buffer sin limite.
+test('P5: whitespace infinito esperando el closer no retiene el stream (tope de buffer)', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  const first = parser.push('{"name": "read_file", "arguments": {}}')
+  assert.equal(first.textDelta, '', 'el payload debe esperar su closer')
+  const second = parser.push(' '.repeat(1024 * 1024 + 128))
+  assert.ok(second.textDelta.length > 0, 'el buffer quedo retenido sin limite esperando un closer')
+  assert.equal(second.completedCalls.length + parser.flush().completedCalls.length, 0)
+  assert.equal(parser.hasParseError(), false)
+})
+
+// P6a: el predicado scoped al objeto lider — una respuesta JSON ordinaria seguida de
+// una llamada real no arma candidatos espurios ni warnings divergentes entre vias.
+// (La llamada posterior sigue cayendo bajo el gate de primer-contenido, igual que en
+// baseline: JSON ordinario ES prosa.)
+test('P6a: JSON ordinario + llamada real despues — sin candidato espurio, sin divergencia', () => {
+  const text = '{"result": "ok"}\n[TOOL CALL]{"name":"read_file","arguments":{"path":"a"}}\n[END TOOL CALL]'
+  const whole = parseToolCallsFromText(text, { allowedToolNames: ['read_file'] })
+  assert.ok(!whole.warnings.some(w => w.type === 'synthetic_rejected'),
+    'un JSON ordinario armo un candidato sintetico espurio')
+  assert.equal(whole.toolCalls.length, 0, 'el gate de primer-contenido debe seguir mandando')
+  assert.equal(whole.cleanedText, '{"result": "ok"}')
+  assert.doesNotMatch(whole.cleanedText, /TOOL CALL/, 'marcado crudo filtrado al texto')
+
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  let visible = ''
+  const calls = []
+  for (const ch of text) { const o = parser.push(ch); visible += o.textDelta; calls.push(...o.completedCalls) }
+  const tail = parser.flush(); visible += tail.textDelta; calls.push(...tail.completedCalls)
+  assert.equal(calls.length, 0)
+  assert.equal(visible.trim(), whole.cleanedText, 'las dos vias divergen')
+  assert.ok(!parser.getWarnings().some(w => w.type === 'synthetic_rejected'),
+    'streaming armo el candidato espurio que la via entera no armo')
+})
+
+// P6b (VG3): una respuesta JSON grande sin clave "name" en la ventana vuelve a fluir
+// incremental — la decision de retencion es acotada, no "hasta que balancee".
+test('P6b: una respuesta JSON grande fluye incremental desde push(), no en flush', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  const body = '{"data": "' + 'x'.repeat(600)
+  let releasedBeforeFlush = ''
+  for (let i = 0; i < body.length; i += 50) {
+    releasedBeforeFlush += parser.push(body.slice(i, i + 50)).textDelta
+  }
+  assert.ok(releasedBeforeFlush.length > 0, 'la respuesta JSON quedo retenida hasta flush')
+  const tail = parser.flush()
+  assert.equal(releasedBeforeFlush + tail.textDelta, body, 'el texto debe llegar completo')
+  assert.equal(parser.hasEmittedAnyCall(), false)
+})
+
+// P6c: un rechazo sintetico no involucra ningun trigger — no puede voltear la
+// semantica de hasTriggeredWithoutCall().
+test('P6c: synthetic_rejected no finge ser un trigger sin payload', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  parser.push('{"name": "NotATool", "arguments": {}}\n[END TOOL CALL]')
+  parser.flush()
+  assert.ok(parser.getWarnings().some(w => w.type === 'synthetic_rejected'))
+  assert.equal(parser.hasTriggeredWithoutCall(), false, 'un rechazo sintetico volteo la semantica')
+
+  const real = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  real.push('<tool_call_read_file>\n</tool_call_read_file>')
+  real.flush()
+  assert.equal(real.hasTriggeredWithoutCall(), true, 'el canal original dejo de reportar')
+})
+
+// P7: el texto de un rechazo sintetico NO alimenta el rastreador de fences — los ```
+// dentro de un string JSON no son Markdown. Si lo alimentara, el trigger genuino que
+// sigue seria "documentacion" y su marcado se filtraria como texto visible.
+test('P7: un payload rechazado con ``` en un string no desincroniza las fences', () => {
+  const rejected = '{"name": "NotATool", "arguments": {"doc": "\n```\nejemplo\n```\n"}}\n[END TOOL CALL]'
+  const text = rejected + '\n[TOOL CALL]{"name":"read_file","arguments":{"path":"a"}}[END TOOL CALL]'
+  const whole = parseToolCallsFromText(text, { allowedToolNames: ['read_file'] })
+  const reasons = whole.warnings.map(w => w.reason)
+  assert.ok(!reasons.includes('inside code context'),
+    'la fence del payload rechazado reclasifico el trigger real como documentacion')
+  assert.ok(reasons.includes('not the first content of the answer'),
+    'el trigger posterior debe entrar al camino normal de triggers')
+  assert.doesNotMatch(whole.cleanedText, /\[TOOL CALL\]/, 'marcado crudo filtrado al texto visible')
+  assert.equal(whole.toolCalls.length, 0)
+
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  let visible = ''
+  for (const ch of text) visible += parser.push(ch).textDelta
+  visible += parser.flush().textDelta
+  assert.doesNotMatch(visible, /\[TOOL CALL\]/, 'streaming filtro el marcado crudo')
+  assert.ok(!parser.getWarnings().some(w => w.reason === 'inside code context'))
+})
+
+// P8: el stream muerto en medio de un closer DUPLICADO (`[END TOOL C` + EOF) es un
+// residuo de protocolo, no una respuesta — flush lo traga. Texto real no-closer tras
+// un closer si se entrega.
+test('P8: flush traga el prefijo viable de un closer duplicado; el texto real no', () => {
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  let visible = ''
+  const calls = []
+  const first = parser.push('{"name":"read_file","arguments":{}}[END TOOL CALL][END TOOL C')
+  calls.push(...first.completedCalls); visible += first.textDelta
+  const tail = parser.flush()
+  calls.push(...tail.completedCalls); visible += tail.textDelta
+  assert.equal(calls.length, 1)
+  assert.equal(visible, '', 'el prefijo del closer duplicado se filtro como texto visible')
+
+  const second = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  second.push('{"name":"read_file","arguments":{}}[END TOOL CALL][nota')
+  assert.equal(second.flush().textDelta, '[nota', 'texto real tras un closer fue tragado')
+})
+
+// P12: la rama angular del tragado de duplicados — </tool_call> repetido tambien se
+// traga, entero y partido en la frontera del chunk.
+test('P12: closers duplicados en forma angular se tragan (entero, streamed y partido)', () => {
+  const text = '<tool_call>' + PAYLOAD + '</tool_call></tool_call>'
+  const whole = parseToolCallsFromText(text, { allowedToolNames: ['read_file'] })
+  assert.equal(whole.toolCalls.length, 1)
+  assert.equal(whole.cleanedText, '', 'el </tool_call> duplicado se filtro al texto')
+
+  const streamed = streamCollect(text, ['read_file'])
+  assert.equal(streamed.calls.length, 1)
+  assert.equal(streamed.visible.trim(), '', 'streaming filtro el duplicado angular')
+
+  const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  const calls = []
+  let visible = ''
+  const a = parser.push('<tool_call>' + PAYLOAD + '</tool_call></tool_')
+  calls.push(...a.completedCalls); visible += a.textDelta
+  const b = parser.push('call>despues')
+  calls.push(...b.completedCalls); visible += b.textDelta
+  visible += parser.flush().textDelta
+  assert.equal(calls.length, 1)
+  assert.equal(visible, 'despues', 'el duplicado angular partido en el chunk se filtro')
 })

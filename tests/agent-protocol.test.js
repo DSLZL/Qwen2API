@@ -1405,4 +1405,47 @@ test('normalizer: clientToolNames filtra que drops cuentan como interceptacion',
   const empty = createUpstreamDeltaNormalizer({ clientToolNames: [] })
   empty({ role: 'function', phase: 'answer', name: 'web_search', content: 'x' })
   assert.deepEqual(empty.interceptedToolNames, ['web_search'])
+
+  // P9: un frame SIN nombre jamas cuenta como evidencia con el filtro activo — ni
+  // siquiera si el cliente declaro un tool literalmente llamado "unknown". El
+  // placeholder de log no puede dejar que un frame anonimo se haga pasar por el.
+  const trap = createUpstreamDeltaNormalizer({ clientToolNames: ['unknown'] })
+  trap({ role: 'function', phase: 'answer', content: 'nameless platform frame' })
+  assert.deepEqual(trap.interceptedToolNames, [], 'un frame sin nombre conto como el tool "unknown"')
+  trap({ role: 'function', phase: 'answer', name: 'unknown', content: 'x' })
+  assert.deepEqual(trap.interceptedToolNames, ['unknown'], 'un tool declarado "unknown" con nombre real si cuenta')
+})
+
+// ── P10: el cableado clientToolNames de la ruta OpenAI, pinneado end-to-end ──
+// Revertir openai-agent-runtime a createUpstreamDeltaNormalizer() pelado debe
+// romper estas dos pruebas — antes nada las cubria.
+
+test('P10: drops de tools internos en la ruta OpenAI no disparan intercepted', async () => {
+  let sent = 0
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('web_search'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async () => { sent += 1; return { status: false } }
+  )
+  assert.equal(sent, 0, 'un drop de web_search quemo un retry intercepted falso')
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'stop')
+  assert.match(result.attempt.visibleText, /unavailable/)
+})
+
+test('P10: los drops internos no queman el slot que malformed_protocol necesita', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('web_search'), agentAnswerFrame(AGENT_LEAK)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(sent.length, 1)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /was NOT executed/, 'la razon debe ser malformed_protocol')
+  assert.doesNotMatch(hint, /did not reach the client/,
+    'web_search conto como interceptacion y robo la razon del retry')
 })

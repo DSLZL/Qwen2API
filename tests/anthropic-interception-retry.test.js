@@ -542,6 +542,28 @@ describe('platform-internal drops are not interception evidence (clientToolNames
     assert.match(res.output, /"type":"message_stop"/);
   });
 
+  it('P11: a clean retry answer is not re-condemned by the previous attempt leak', async () => {
+    // attempt 1 filtra residuo (leak con nombre NO permitido) → retry malformed_protocol;
+    // attempt 2 responde prosa limpia. La clasificacion lee el texto DEL INTENTO:
+    // con el acumulado, el residuo del attempt 1 volveria a condenar al attempt 2 y
+    // apareceria el warn de give-up (协议恢复重试已用完) sin motivo.
+    const sender = scriptedSender(turnOf(answerFrame('Listo: no hay nada que ejecutar.')));
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), sender);
+    });
+
+    assert.equal(sender.calls.length, 1, 'attempt 1 debe reintentar por malformed_protocol');
+    assert.ok(warns.some(line => /malformed_protocol/.test(line)), `falta el rechazo del attempt 1:\n${warns.join('\n')}`);
+    assert.ok(
+      !warns.some(line => /协议恢复重试已用完/.test(line)),
+      `el texto acumulado condeno al attempt 2 limpio:\n${warns.join('\n')}`
+    );
+    assert.match(res.output, /Listo: no hay nada que ejecutar\./);
+    assert.match(res.output, /"type":"message_stop"/);
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
   it('non-stream: web_search drops do not burn the shared recovery slot', async () => {
     // El slot queda libre: un leak malformado en el retry posterior AUN puede usarlo.
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
