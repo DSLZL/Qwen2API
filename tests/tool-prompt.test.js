@@ -317,12 +317,14 @@ test('matriz corchetes: un link Markdown [tool calls](url) no dispara una llamad
 
   // La deteccion vive en el punto de resolucion del payload, no en un lookahead del regex,
   // justamente para que streaming y texto-completo NO diverjan en la frontera de chunk
-  // entre `]` y `(`. Se comprueba que el parser incremental da el mismo 0.
+  // entre `]` y `(`. Se comprueba que el parser incremental da el mismo 0 Y el mismo texto.
   const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
+  let visible = ''
   const calls = []
-  for (const ch of md) { const o = parser.push(ch); calls.push(...o.completedCalls) }
-  const tail = parser.flush(); calls.push(...tail.completedCalls)
+  for (const ch of md) { const o = parser.push(ch); visible += o.textDelta + o.recoveredText; calls.push(...o.completedCalls) }
+  const tail = parser.flush(); visible += tail.textDelta + tail.recoveredText; calls.push(...tail.completedCalls)
   assert.equal(calls.length, 0, 'streaming ejecuto el link Markdown como llamada (divergencia)')
+  assert.equal(visible, result.cleanedText, 'el texto visible en streaming diverge del parser de texto completo')
 
   // Y la llamada real de la misma forma sigue recuperandose en ambas rutas.
   const real = parseToolCallsFromText('[TOOL CALL]\n{"name":"read_file","arguments":{"path":"a"}}\n[END TOOL CALL]',

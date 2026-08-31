@@ -206,6 +206,8 @@ function lzwCompress(data, bits, charFunc) {
 
         enlargeIn--;
         if (enlargeIn === 0) {
+            // The in-loop twin also resets enlargeIn here; in this flush block that
+            // reset is a dead store — enlargeIn is never read again, only numBits is.
             numBits++;
         }
     }

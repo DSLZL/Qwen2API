@@ -62,9 +62,6 @@ const handleGetModels = async (req, res) => {
             models.push(buildPublicModelData(model, '-image-edit'))
         }
 
-        // if (isDeepResearch) {
-        //     models.push(buildPublicModelData(model, '-deep-research'))
-        // }
     }
     res.json({
         "object": "list",

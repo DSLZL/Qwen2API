@@ -117,7 +117,7 @@ test('getCliAvailability maps every unavailability reason', () => {
 // Regression: `chatBaseUrl` used to be declared inside the try, so the catch's
 // log line threw a ReferenceError that masked the real authorization failure
 // and turned the promise into a rejection instead of `false`.
-test('authorizeLogin returns false and logs the URL when authorization fails', async () => {
+test('authorizeLogin returns false and logs status + URL on a non-ok response', async () => {
   const { logger } = require('../src/utils/logger');
   const originalFetch = global.fetch;
   const originalError = logger.error;
@@ -136,13 +136,38 @@ test('authorizeLogin returns false and logs the URL when authorization fails', a
     const onNonOk = await cliManager.authorizeLogin('user-code', 'token');
     assert.equal(onNonOk, false);
 
+    // The FIRST log (before the catch) must carry the response detail — that
+    // log's content is half the point of the fix.
+    assert.ok(logged.length >= 2, 'expected the pre-catch log plus the catch log');
+    const firstDetail = logged[0].find(a => a && typeof a === 'object');
+    assert.equal(firstDetail?.status, 403);
+    assert.equal(firstDetail?.body, 'denied');
+
+    const urlLogs = logged.filter(args =>
+      args.some(a => a && typeof a === 'object' && String(a.url || '').includes('/api/v2/oauth2/authorize')));
+    assert.equal(urlLogs.length, 1);
+  } finally {
+    global.fetch = originalFetch;
+    logger.error = originalError;
+  }
+});
+
+test('authorizeLogin returns false and logs the URL when fetch itself throws', async () => {
+  const { logger } = require('../src/utils/logger');
+  const originalFetch = global.fetch;
+  const originalError = logger.error;
+
+  const logged = [];
+  logger.error = (...args) => { logged.push(args); };
+
+  try {
     global.fetch = async () => { throw new Error('network down'); };
     const onThrow = await cliManager.authorizeLogin('user-code', 'token');
     assert.equal(onThrow, false);
 
     const urlLogs = logged.filter(args =>
       args.some(a => a && typeof a === 'object' && String(a.url || '').includes('/api/v2/oauth2/authorize')));
-    assert.equal(urlLogs.length, 2);
+    assert.equal(urlLogs.length, 1);
   } finally {
     global.fetch = originalFetch;
     logger.error = originalError;
