@@ -855,9 +855,9 @@ test('externalized Agent context keeps system rules active task and recent tool 
     JSON.stringify({ role: 'system', content: 'SYSTEM_RULE_MUST_SURVIVE' }),
     JSON.stringify({ role: 'user', content: 'ACTIVE_TASK_MUST_SURVIVE: fix and verify the project' }),
     JSON.stringify({ role: 'assistant', content: '<tool_call>{"name":"bash","arguments":{"command":"test"}}</tool_call>' }),
-    JSON.stringify({ role: 'user', content: `<tool_response name="bash">RECENT_PROGRESS_MUST_SURVIVE ${'x'.repeat(5000)}</tool_response>` }),
+    JSON.stringify({ role: 'user', content: `[TOOL RESULT: bash]\nRECENT_PROGRESS_MUST_SURVIVE ${'x'.repeat(5000)}\n[END TOOL RESULT]` }),
     '# Current message',
-    JSON.stringify({ role: 'user', content: '<tool_response name="bash">CURRENT_RESULT_MUST_SURVIVE</tool_response>' }),
+    JSON.stringify({ role: 'user', content: '[TOOL RESULT: bash]\nCURRENT_RESULT_MUST_SURVIVE\n[END TOOL RESULT]' }),
     buildAgentTurnDirective({ afterToolResult: true })
   ].join('\n')
   const result = await externalizeOversizedAgentContext(
@@ -876,6 +876,16 @@ test('externalized Agent context keeps system rules active task and recent tool 
   assert.match(live, /RECENT_PROGRESS_MUST_SURVIVE/)
   assert.match(live, /CURRENT_RESULT_MUST_SURVIVE/)
   assert.match(live, /not a reason to stop after one action/)
+
+  // El lock-step con foldToolMessages hay que afirmarlo SOBRE LA SECCION, no sobre el
+  // prompt entero: ACTIVE_TASK_MUST_SURVIVE tambien aparece en el JSONL crudo de
+  // "Recent Agent history", asi que la asercion global seguia verde con el guard borrado.
+  // Si buildEssentialAgentHistory deja de reconocer [TOOL RESULT: ...], elige un bloque
+  // de resultado como "tarea activa" y esta seccion trae TOOL RESULT.
+  const activeSection = live.slice(live.indexOf('## Active user task')).split('\n# ')[0]
+  assert.match(activeSection, /ACTIVE_TASK_MUST_SURVIVE/, 'la tarea activa real no quedo en su seccion')
+  assert.doesNotMatch(activeSection, /TOOL RESULT/, 'un resultado de herramienta se eligio como tarea activa')
+  assert.doesNotMatch(activeSection, /tool_response/, 'un resultado en formato viejo se eligio como tarea activa')
 
   const recovered = compactAgentContextFallback(original, 8192)
   assert.match(recovered, /SYSTEM_RULE_MUST_SURVIVE/)

@@ -114,8 +114,11 @@ const buildEssentialAgentHistory = (entries) => {
     const systemEntries = entries.filter(entry => ['system', 'developer'].includes(entry.role))
     const activeTask = [...entries].reverse().find(entry =>
         entry.role === 'user' &&
-        !/^\s*<tool_response\b/i.test(entry.content) &&
-        !/^\s*\[tool[_ ]result/i.test(entry.content)
+        // 和 foldToolMessages 的结果分隔符锁步：[TOOL RESULT: …] 是当前写法，
+        // <tool_response …> 是旧写法 —— 换分隔符时半路上的历史里两种都在，都要认。
+        !/^\s*\[tool[_ ]result\b/i.test(entry.content) &&
+        !/^\s*\[end tool result\]/i.test(entry.content) &&
+        !/^\s*<tool_response\b/i.test(entry.content)
     )
 
     const sections = []
