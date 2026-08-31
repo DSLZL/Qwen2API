@@ -548,6 +548,17 @@ const gateToolName = (payload, allowedToolNames) => {
 // 这正是“标签写坏了却一行日志都没有”的另一半原因。
 const warnTool = (message, data) => logger.warn?.(message, 'TOOL', '', data ?? null);
 
+// invalid_json 的 reason 是 JSON.parse 的 e.message —— 现代 V8 会把负载片段原文嵌进去
+// （`Unexpected token 'S', ..."<负载回显>"... is not valid JSON`）。错误**对象**保留完整
+// reason（重试提示与测试依赖它），但日志层只放行开头的错误种类：砍在第一个引号 /
+// 换行 / " in JSON" / " at position" 边界，并封顶长度。诊断需要的是原因，不是内容。
+const sanitizeJsonReasonForLog = (reason) => {
+  const text = String(reason || '');
+  const cut = text.search(/["'`‘’“”\n\r]| in JSON| at position/i);
+  const head = (cut === -1 ? text : text.slice(0, cut)).trim();
+  return (head || 'invalid_json').slice(0, 120);
+};
+
 // 只登记“为什么失败”和“多长”，绝不把负载本身打进日志：工具参数里可能有凭据、
 // 令牌或 email:password。诊断需要的是原因，不是内容。
 const logToolError = (error) => {
@@ -557,7 +568,10 @@ const logToolError = (error) => {
     return;
   }
   const size = typeof error.raw === 'string' ? error.raw.length : 0;
-  warnTool(`解析 tool_call 负载失败（${error.reason || error.type}，负载 ${size} 字符）`);
+  const reason = error.type === 'invalid_json'
+    ? sanitizeJsonReasonForLog(error.reason)
+    : (error.reason || error.type);
+  warnTool(`解析 tool_call 负载失败（${reason}，负载 ${size} 字符）`);
 };
 
 // 触发器被当成文档压制掉时也要留痕。静默压制正是这次要消灭的失败类型：

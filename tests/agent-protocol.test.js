@@ -29,6 +29,7 @@ const {
   parseAgentControlText,
   createAgentControlStreamParser
 } = require('../src/utils/agent-turn.js')
+const { logger } = require('../src/utils/logger.js')
 
 test.after(() => {
   require('../src/utils/account.js').destroy()
@@ -213,25 +214,38 @@ test('OpenAI stream preserves length, accepts clean EOF and rejects transport ab
 test('thinking-only Agent turns retry once and recover visible output', async () => {
   let openAIRetries = 0
   const openAIRes = createMockResponse()
-  await handleStreamResponse(
-    openAIRes,
-    Readable.from(['data: {"choices":[{"delta":{"phase":"think","content":"planning"},"finish_reason":null}]}\n\n']),
-    true,
-    false,
-    { messages: [{ role: 'user', content: 'finish the task' }] },
-    {
-      sendChatRequest: async () => {
-        openAIRetries += 1
-        return {
-          status: true,
-          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"recovered"},"finish_reason":null}]}\n\n'])
+  // R11d: la ruta legacy (sin has_tools) pasa por chat.js:831 — antes un
+  // logger.warning?.() mudo; ahora el retry de compensacion debe dejar linea.
+  const warnLines = []
+  const savedWarn = logger.warn
+  logger.warn = (msg) => { warnLines.push(String(msg)) }
+  try {
+    await handleStreamResponse(
+      openAIRes,
+      Readable.from(['data: {"choices":[{"delta":{"phase":"think","content":"planning"},"finish_reason":null}]}\n\n']),
+      true,
+      false,
+      { messages: [{ role: 'user', content: 'finish the task' }] },
+      {
+        sendChatRequest: async () => {
+          openAIRetries += 1
+          return {
+            status: true,
+            response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"recovered"},"finish_reason":null}]}\n\n'])
+          }
         }
       }
-    }
-  )
+    )
+  } finally {
+    logger.warn = savedWarn
+  }
   assert.equal(openAIRetries, 1)
   assert.match(openAIRes.output, /recovered/)
   assert.match(openAIRes.output, /"finish_reason":"stop"/)
+  assert.ok(
+    warnLines.some(line => /Agent 首次响应没有正文或工具调用，进行一次补偿重试/.test(line)),
+    `chat.js legacy stream retry must log its compensation line, got:\n${warnLines.join('\n')}`
+  )
 
   let anthropicRetries = 0
   const anthropicRes = createMockResponse()
@@ -255,6 +269,38 @@ test('thinking-only Agent turns retry once and recover visible output', async ()
   assert.equal(anthropicRetries, 1)
   assert.match(anthropicRes.output, /recovered/)
   assert.match(anthropicRes.output, /event: message_stop/)
+})
+
+// R11d: el gemelo non-stream de la ruta legacy (chat.js:1174, otro logger.warning?.()
+// mudo hasta este ciclo) — un turno solo-thinking reintenta una vez y deja linea.
+test('legacy non-stream empty-output retry logs its compensation line', async () => {
+  const warnLines = []
+  const savedWarn = logger.warn
+  logger.warn = (msg) => { warnLines.push(String(msg)) }
+  const res = createMockResponse()
+  try {
+    await handleNonStreamResponse(
+      res,
+      Readable.from(['data: {"choices":[{"delta":{"phase":"think","content":"planning"},"finish_reason":null}]}\n\ndata: [DONE]\n\n']),
+      false,
+      false,
+      'qwen-test',
+      { messages: [{ role: 'user', content: 'finish the task' }] },
+      {
+        sendChatRequest: async () => ({
+          status: true,
+          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"recovered"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'])
+        })
+      }
+    )
+  } finally {
+    logger.warn = savedWarn
+  }
+  assert.match(res.output, /recovered/)
+  assert.ok(
+    warnLines.some(line => /Agent 首次响应没有正文或工具调用，进行一次补偿重试/.test(line)),
+    `chat.js legacy non-stream retry must log its compensation line, got:\n${warnLines.join('\n')}`
+  )
 })
 
 test('strict OpenAI Agent gate streams reasoning but keeps rejected answer attempts isolated', async () => {
@@ -617,7 +663,9 @@ test('a standalone tool call emitted in the thinking phase remains executable', 
 // Pin de las guardas de promocion del loop A (evidencia read-only, sin cambio de src):
 // la promocion desde thinking exige cleanedText VACIO — un call flanqueado por prosa
 // de razonamiento es una cita/deliberacion, no una accion. Los loops B y C copian
-// exactamente estas guardas (spec toolcall-salvage-2); si alguien las relaja aqui,
+// estas guardas (openai-agent-runtime.js:232-243) y les SUMAN dos conjuntos mas
+// estrictos que A no tiene — allowlist no vacia (fail closed) y cero tool errors del
+// lado answer (spec toolcall-salvage-2 + review R1); si alguien relaja las de A aqui,
 // este test se pone rojo antes de que la relajacion se propague por paridad.
 test('A-parity pin: a think call flanked by reasoning prose is NOT promoted', async () => {
   let retries = 0

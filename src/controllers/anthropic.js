@@ -867,6 +867,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         normalizeDelta.interceptedToolNames.length > 0) {
       hint = `${hint}\n${buildAgentRetryHint('intercepted')}`;
     }
+    // 同一个模式的 think 版本：required / tool_error 盖住 thought_tool_call 时，
+    // 提示词仍要带上关键事实 —— 调用写在了模型自己够不到的隐藏推理里。
+    // （missing_tool / empty 排在 thought_tool_call 之后，证据在时轮不到它们。）
+    if ((reason === 'required' || reason === 'tool_error') && attemptThinkEvidence) {
+      hint = `${hint}\n${buildAgentRetryHint('thought_tool_call')}`;
+    }
     return hint;
   };
 
@@ -913,12 +919,17 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     hasEmittedToolCalls = !!(nativeToolCalls.length > 0 || parser?.hasEmittedAnyCall());
 
     // think phase 的回合定案：正文侧一无所获时，把本轮思考文本过一遍共享解析器。
-    // 晋升守卫与 A 逐字对齐（openai-agent-runtime.js:232-246）：正文零调用、正文
-    // 可见文本为空、正文侧零工具错误、think 解析出 ≥1 个调用、think 除调用外一无
-    // 所有（cleanedText 空）、think 解析零错误 —— 且必须有**非空**的白名单（无白名单
-    // 时共享解析器的名字闸门放行一切，fail closed：不晋升）。这不是新的安全边界：
-    // A 自兼容工作以来一直在做同一个晋升，同一套守卫。守卫不满足但 think 里确实
-    // 出现了调用（或其解析残骸）时，那是排放证据 —— 交给 thought_tool_call 重试。
+    // 晋升守卫 = A 的守卫（openai-agent-runtime.js:232-243：正文零调用且正文文本为空
+    // 才解析 think；think 有调用、think cleanedText 为空、think 零解析错误才晋升）
+    // **外加两条这里更严的本地守卫** —— A 没有它们，B/C 刻意收紧：
+    //   1) 必须有非空白名单（无白名单时共享解析器的名字闸门放行一切 —— fail closed，
+    //      不晋升）；
+    //   2) 正文侧零工具错误（A 靠 evaluate 先按 toolErrors 拒绝整轮达到同一效果，
+    //      B 的晋升发生在 decideRetryReason 之前，必须自己带上这条）。
+    // 终止性 finish（length/content_filter/refusal）既不晋升也不重试 —— 与
+    // intercepted/missing_tool/empty 同一纪律。这不是新的安全边界：A 自兼容工作以来
+    // 一直在做同一个晋升。守卫不满足但 think 里确实出现了调用（或其解析残骸）时，
+    // 那是排放证据 —— 交给 thought_tool_call 重试。
     if (hasTools && !hasEmittedToolCalls) {
       const thinkParsed = parseToolCallsFromText(attemptThinkText, { allowedToolNames });
       const promotable = allowedToolNames.length > 0 &&
@@ -926,7 +937,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         thinkParsed.errors.length === 0 &&
         !thinkParsed.cleanedText.trim() &&
         !attemptVisibleText.trim() &&
-        currentToolErrors().length === 0;
+        currentToolErrors().length === 0 &&
+        !terminalFinish();
       if (promotable) {
         for (const call of thinkParsed.toolCalls) emitToolUse(call);
         hasEmittedToolCalls = true;
@@ -938,9 +950,11 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     const retryReason = decideRetryReason(hasEmittedToolCalls);
     if (!retryReason) break;
     if (attemptsMade >= maxAttempts) {
-      // 以前这里静默 break：生产环境分不清"回合被接受"和"次数用尽、按原样交付"。
+      // 以前这里静默 break：生产环境分不清"回合被接受"和"次数用尽"。措辞保持中立：
+      // 接下来可能按原样交付，也可能收敛成 invalid_tool_call_error / api_error（
+      // required 未兑现、纯工具错误无正文），这里不预判结局。
       logger.warn(
-        `Anthropic Agent 尝试次数用尽（${attemptsMade}/${maxAttempts}），最后一轮仍被拒绝 (${retryReason})，按原样交付`,
+        `Anthropic Agent 尝试次数用尽（${attemptsMade}/${maxAttempts}），最后一轮仍被拒绝 (${retryReason})`,
         'ANTHROPIC'
       );
       break;
@@ -1219,10 +1233,15 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
 
-  // think phase 的回合定案（与流式分支同一套，注释见彼处）：正文侧一无所获时把
-  // 本轮思考文本过共享解析器 —— 晋升守卫与 A 逐字对齐（openai-agent-runtime.js:
-  // 232-246，含无白名单不晋升的 fail closed），守卫不满足但确有调用/残骸时留下
-  // thought_tool_call 的排放证据。每次正文重新结算后都要重新定案。
+  // 非流式没有"已经写到线上"的问题：什么都还没发出去，所以每一轮都可以重试。
+  const terminalFinish = () =>
+    ['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
+
+  // think phase 的回合定案（与流式分支同一套守卫，注释见彼处：A 的守卫
+  // —— openai-agent-runtime.js:232-243 —— 外加两条这里更严的本地守卫：非空白名单
+  // fail closed、正文侧零工具错误；终止性 finish 既不晋升也不重试）。守卫不满足
+  // 但确有调用/残骸时留下 thought_tool_call 的排放证据。每次正文重新结算后都要
+  // 重新定案。
   let attemptThinkEvidence = false;
   const settleThinkPhase = () => {
     attemptThinkEvidence = false;
@@ -1233,18 +1252,24 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       thinkParsed.errors.length === 0 &&
       !thinkParsed.cleanedText.trim() &&
       !cleanedText.trim() &&
-      toolErrors.length === 0;
+      toolErrors.length === 0 &&
+      !terminalFinish();
     if (promotable) {
+      // 晋升时，交付的 thinking 不再携带原始协议负载 —— 与 A 剥离 reasoning 同义
+      // （openai-agent-runtime.js:262 晋升后返回 cleanedText）。与流式分支不同，
+      // 这里什么都还没发给客户端，遏制是免费的：把本轮 think 段（thinkingContent
+      // 的尾巴）换成解析后的 cleanedText；searchTable 前缀与既往轮次的思考不动。
+      // 非晋升路径（含重试后的恢复轮）保持原样交付。
+      if (attemptThinkingContent && thinkingContent.endsWith(attemptThinkingContent)) {
+        thinkingContent = thinkingContent.slice(0, thinkingContent.length - attemptThinkingContent.length) +
+          thinkParsed.cleanedText;
+      }
       toolCalls = thinkParsed.toolCalls.map((call, index) => ({ ...call, index }));
       return;
     }
     attemptThinkEvidence = thinkParsed.toolCalls.length > 0 || thinkParsed.errors.length > 0;
   };
   settleThinkPhase();
-
-  // 非流式没有"已经写到线上"的问题：什么都还没发出去，所以每一轮都可以重试。
-  const terminalFinish = () =>
-    ['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason);
 
   const decideRetryReason = () => {
     if (toolCalls.length > 0) return null;
@@ -1335,8 +1360,17 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         normalizeDelta.interceptedToolNames.length > 0) {
       hint = `${hint}\n${buildAgentRetryHint('intercepted')}`;
     }
+    // 同一个模式的 think 版本：required / tool_error 盖住 thought_tool_call 时，
+    // 提示词仍要带上关键事实 —— 调用写在了模型自己够不到的隐藏推理里。
+    if ((retryReason === 'required' || retryReason === 'tool_error') && attemptThinkEvidence) {
+      hint = `${hint}\n${buildAgentRetryHint('thought_tool_call')}`;
+    }
 
-    if (retryReason === 'intercepted' && cleanedText.trim()) {
+    // finding 2 的教义对 thought_tool_call 同样成立：14:08 形态（think 泄漏 + 成功
+    // 叙述）的重试若空手而归，绝不能拿 502 换掉已经拿到的叙述。malformed_protocol
+    // 刻意不在此列：它的 cleanedText 就是泄漏的协议残渣本身（负载 + 孤儿闭标记），
+    // 兜底交付它等于把这套防御要挡的裸协议原样递给客户端。
+    if ((retryReason === 'intercepted' || retryReason === 'thought_tool_call') && cleanedText.trim()) {
       narrationFallback = cleanedText;
     }
 
@@ -1381,6 +1415,19 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
     // 重试轮的 think phase 同样要定案：晋升或留证据，下一次 decideRetryReason 才看得见。
     settleThinkPhase();
+  }
+
+  // 与流式分支对称的收尾观测：次数用尽而最后一轮仍被拒绝时留痕（协议恢复的
+  // give-up 在循环内已有自己的日志，且只在 attemptsMade < maxAttempts 时触发，
+  // 不会与这行重复）。措辞中立：接下来可能按原样交付、502 或兜底叙述，不预判。
+  if (!streamBrokeOnRetry && attemptsMade >= maxAttempts) {
+    const finalRejection = decideRetryReason();
+    if (finalRejection) {
+      logger.warn(
+        `Anthropic 非流式 Agent 尝试次数用尽（${attemptsMade}/${maxAttempts}），最后一轮仍被拒绝 (${finalRejection})`,
+        'ANTHROPIC'
+      );
+    }
   }
 
   if (streamBrokeOnRetry) {

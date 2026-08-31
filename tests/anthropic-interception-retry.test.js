@@ -589,10 +589,12 @@ describe('platform-internal drops are not interception evidence (clientToolNames
 // el think verbatim (emitThinkingDelta, sin parser): la llamada llego al bloque
 // thinking del cliente, nunca se ejecuto, no alimento ningun retry, y la narracion
 // "ya escribi el archivo" quedo como respuesta — una escritura alucinada. Loop A ya
-// defiende esta superficie (openai-agent-runtime.js:232-242); aqui se lleva B y C a
-// esa misma paridad: promocion bajo las guardas EXACTAS de A, y si no, evidencia de
-// emision → una razon one-shot `thought_tool_call` que comparte el cupo de
-// recuperacion de protocolo con intercepted/malformed_protocol.
+// defiende esta superficie (openai-agent-runtime.js:232-243); aqui se lleva B y C a
+// esa paridad: promocion bajo las guardas de A MAS dos conjuntos mas estrictos que A
+// no tiene (allowlist no vacia fail-closed; cero tool errors del lado answer) y la
+// disciplina terminal-finish, y si no, evidencia de emision → una razon one-shot
+// `thought_tool_call` que comparte el cupo de recuperacion de protocolo con
+// intercepted/malformed_protocol.
 
 // Reconstruccion del leak de las 14:08: [TOOL_CALL] + JSON truncado a mitad de un
 // string + cola XML ajena (</parameter></function>). Nunca es promovible (el parse
@@ -765,7 +767,11 @@ describe('think-phase tool-call leak (loop C non-stream)', () => {
     assert.equal(res.statusCode, 200);
     const blocks = res.body?.content || [];
     assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), ['read_file']);
-    assert.ok(blocks.some(b => b.type === 'thinking'), 'the thinking field keeps existing C semantics');
+    // R10: al promover, el thinking entregado es el cleanedText del parse — el payload
+    // crudo jamas viaja en el bloque thinking (aqui el think era SOLO la llamada, asi
+    // que no queda bloque thinking en absoluto).
+    const thinkingText = blocks.filter(b => b.type === 'thinking').map(b => b.thinking).join('');
+    assert.doesNotMatch(thinkingText, /TOOL CALL/, 'el payload promovido viajo en el thinking');
     assert.equal(res.body.stop_reason, 'tool_use');
   });
 
@@ -804,6 +810,290 @@ describe('control-char payload repair (the 13:36 invalid_json class)', () => {
     const blocks = res.body?.content || [];
     assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), ['read_file']);
     assert.equal(res.body.stop_reason, 'tool_use');
+  });
+});
+
+// ── Endurecimiento post-review adversarial (R1-R13) ──
+
+// Frame nativo con nombre de tool NO declarado: unica via en C de tener toolErrors
+// con cero texto visible (los spans de error del parser de texto viajan como debris
+// visible en cleanedText).
+const nativeUnknownFrame = () => `data: ${JSON.stringify({
+  choices: [{
+    delta: { phase: 'answer', tool_calls: [{ index: 0, type: 'function', function: { name: 'nope', arguments: '{}' } }] },
+    finish_reason: null
+  }]
+})}\n\n`;
+
+const CONTENT_FILTER_STOP = 'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\ndata: [DONE]\n\n';
+
+describe('fail closed: empty allowlist never promotes (R2)', () => {
+  it('stream: hasTools + empty allowlist + standalone think call → one thought retry, zero promotion', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('No tools were actually declared.')));
+    const res = await runStream(turnOf(thinkFrame(BRACKET_CALL)), sender, { allowedToolNames: [] });
+
+    assert.equal(sender.calls.length, 1, 'must retry, never promote without a whitelist');
+    assert.match(JSON.stringify(sender.calls[0]), /emitted inside your hidden reasoning/);
+    assert.deepEqual(toolUseNames(res.output), [], 'promotion fired without a whitelist');
+    assert.match(res.output, /"type":"message_stop"/);
+  });
+
+  it('non-stream: same fail-closed discipline', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('No tools were actually declared.')));
+    const res = await runNonStream(turnOf(thinkFrame(BRACKET_CALL)), sender, { allowedToolNames: [] });
+
+    assert.equal(sender.calls.length, 1);
+    assert.match(JSON.stringify(sender.calls[0]), /emitted inside your hidden reasoning/);
+    assert.equal(res.statusCode, 200);
+    const blocks = res.body?.content || [];
+    assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), []);
+  });
+});
+
+describe('loop C shares the single protocol-recovery slot (R3)', () => {
+  it('two consecutive non-stream think-leaks: one retry, narration delivered, give-up warn', async () => {
+    const sender = scriptedSender(turnOf(thinkFrame(THINK_LEAK_TRUNCATED), answerFrame(SUCCESS_NARRATION)));
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runNonStream(turnOf(thinkFrame(THINK_LEAK_TRUNCATED), answerFrame(SUCCESS_NARRATION)), sender);
+    });
+
+    assert.equal(sender.calls.length, 1, 'second think-leak must deliver as-is, no loop');
+    assert.equal(res.statusCode, 200);
+    const text = (res.body?.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    assert.match(text, /written with all the findings/);
+    assert.ok(
+      warns.some(line => /协议恢复重试已用完/.test(line) && /thought_tool_call/.test(line)),
+      `expected the C give-up warn naming thought_tool_call, got:\n${warns.join('\n')}`
+    );
+  });
+
+  it('empty-answer non-stream think-leaks stop at the shared slot, not maxAttempts', async () => {
+    const sender = scriptedSender(
+      turnOf(thinkFrame(THINK_LEAK_TRUNCATED)),
+      turnOf(thinkFrame(THINK_LEAK_TRUNCATED)),
+      turnOf(answerFrame(BRACKET_CALL))
+    );
+    await runNonStream(turnOf(thinkFrame(THINK_LEAK_TRUNCATED)), sender);
+
+    assert.equal(sender.calls.length, 1, 'exactly ONE thought_tool_call retry per request (C)');
+  });
+
+  it('non-stream: thought_tool_call shares the ONE slot with intercepted', async () => {
+    const sender = scriptedSender(
+      turnOf(thinkFrame(THINK_LEAK_TRUNCATED)),
+      turnOf(answerFrame(BRACKET_CALL))
+    );
+    await runNonStream(turnOf(interceptionFrame('read_file')), sender);
+
+    assert.equal(sender.calls.length, 1, 'one protocol-recovery retry TOTAL, not one per reason (C)');
+  });
+});
+
+describe('thought_tool_call outranks missing_tool (R4)', () => {
+  const ACTION_NARRATION = "I'll run the command now to finish this.";
+
+  it('stream: action-flavored narration after a think leak still gets the thought hint', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runStream(turnOf(thinkFrame(THINK_LEAK_TRUNCATED), answerFrame(ACTION_NARRATION)), sender);
+    });
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /emitted inside your hidden reasoning/);
+    assert.doesNotMatch(hint, /described an action/, 'missing_tool won the slot: precedence regressed');
+    assert.ok(warns.some(line => /thought_tool_call/.test(line)), 'the shared slot must be consumed under the thought reason');
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+  });
+
+  it('non-stream: same precedence', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runNonStream(turnOf(thinkFrame(THINK_LEAK_TRUNCATED), answerFrame(ACTION_NARRATION)), sender);
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /emitted inside your hidden reasoning/);
+    assert.doesNotMatch(hint, /described an action/);
+    const blocks = res.body?.content || [];
+    assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), ['read_file']);
+  });
+});
+
+describe('answer-side tool errors block promotion (R5) and the hint carries the thought appendix (R6)', () => {
+  it('stream: truncated answer payload + valid think call → tool_error retry with appendix, no promotion', async () => {
+    const TRUNCATED_ANSWER = '[TOOL CALL]{"name":"read_file","arguments":{';
+    const sender = scriptedSender(turnOf(answerFrame('Nothing further to run.')));
+    const res = await runStream(turnOf(thinkFrame(BRACKET_CALL), answerFrame(TRUNCATED_ANSWER)), sender);
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /invalid, truncated, or unknown tool call/, 'tool_error must keep the reason slot');
+    assert.match(hint, /emitted inside your hidden reasoning/, 'R6: the masked think evidence must ride along');
+    assert.deepEqual(toolUseNames(res.output), [], 'the think call must not promote past answer-side errors');
+    assert.match(res.output, /"type":"message_stop"/);
+  });
+
+  it('non-stream: native unknown-tool error + valid think call → tool_error retry with appendix, no promotion', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('Nothing further to run.')));
+    const res = await runNonStream(turnOf(nativeUnknownFrame(), thinkFrame(BRACKET_CALL)), sender);
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /invalid, truncated, or unknown tool call/);
+    assert.match(hint, /emitted inside your hidden reasoning/);
+    assert.equal(res.statusCode, 200);
+    const blocks = res.body?.content || [];
+    assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), []);
+  });
+
+  it('stream: required masks the think evidence but the hint carries the appendix (R6)', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runStream(turnOf(thinkFrame(THINK_LEAK_TRUNCATED)), sender, { toolChoice: 'required' });
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /You did not call any tool/, 'required must keep the reason slot');
+    assert.match(hint, /emitted inside your hidden reasoning/, 'R6: the masked think evidence must ride along');
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+  });
+});
+
+describe('terminal finish blocks promotion and retry (R7)', () => {
+  it('stream: standalone think call + content_filter → no promotion, no retry, refusal', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('unused')));
+    const res = await runStream(() => Readable.from([thinkFrame(BRACKET_CALL), CONTENT_FILTER_STOP]), sender);
+
+    assert.equal(sender.calls.length, 0, 'terminal discipline: no retry');
+    assert.deepEqual(toolUseNames(res.output), [], 'terminal discipline: no promotion, no execution');
+    assert.match(res.output, /"stop_reason":"refusal"/);
+  });
+
+  it('non-stream: same discipline', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('unused')));
+    const res = await runNonStream(() => Readable.from([thinkFrame(BRACKET_CALL), CONTENT_FILTER_STOP]), sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.equal(res.statusCode, 200);
+    const blocks = res.body?.content || [];
+    assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), []);
+    assert.equal(res.body.stop_reason, 'refusal');
+  });
+});
+
+describe('exhaustion observability (R8)', () => {
+  it('stream: a neutral exhaustion warn, no delivery claim', async () => {
+    const sender = scriptedSender(turnOf(), turnOf());
+    const warns = await captureWarns(async () => {
+      await runStream(turnOf(), sender);
+    });
+
+    assert.equal(sender.calls.length, 2, 'empty retries burn up to maxAttempts');
+    const line = warns.find(l => /尝试次数用尽（3\/3）/.test(l));
+    assert.ok(line, `expected the stream exhaustion warn, got:\n${warns.join('\n')}`);
+    assert.match(line, /最后一轮仍被拒绝 \(empty\)/);
+    assert.doesNotMatch(line, /按原样交付/, 'the warn must not assert a delivery that may not happen');
+  });
+
+  it('non-stream: exhaustion + protocol-failure warns and the 502 body (R8a + R11b)', async () => {
+    const sender = scriptedSender(turnOf(nativeUnknownFrame()), turnOf(nativeUnknownFrame()));
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runNonStream(turnOf(nativeUnknownFrame()), sender);
+    });
+
+    assert.equal(sender.calls.length, 2);
+    assert.ok(
+      warns.some(l => /非流式 Agent 尝试次数用尽（3\/3）/.test(l) && /tool_error/.test(l)),
+      `expected the C exhaustion warn, got:\n${warns.join('\n')}`
+    );
+    assert.ok(
+      warns.some(l => /非流式工具协议失败，3\/3 次尝试后放弃/.test(l) && /unknown_tool: nope/.test(l)),
+      `expected the protocol-failure warn with the detail, got:\n${warns.join('\n')}`
+    );
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.body?.error?.type, 'invalid_tool_call_error');
+    assert.match(res.body?.error?.message || '', /unknown_tool: nope/);
+  });
+});
+
+describe('narration fallback covers thought_tool_call (R9)', () => {
+  it('non-stream 14:08 shape: an empty thought retry delivers the narration, never a 502', async () => {
+    // attempt 1: think leak + narracion → thought retry (narracion respaldada);
+    // attempt 2: vacio → empty retry; sender agotado → break. Sin el fallback,
+    // cleanedText quedo vacio y el turno moria en 502.
+    const sender = scriptedSender(turnOf());
+    const res = await runNonStream(turnOf(thinkFrame(THINK_LEAK_TRUNCATED), answerFrame(SUCCESS_NARRATION)), sender);
+
+    assert.equal(res.statusCode, 200, 'the narration must beat a 502');
+    const text = (res.body?.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    assert.match(text, /written with all the findings/, 'the think-leak attempt narration is the fallback answer');
+    assert.equal(res.body.stop_reason, 'end_turn');
+    assert.equal(sender.calls.length, 2, 'thought retry + the empty-reason retry that found no sender turn');
+  });
+});
+
+describe('promoted thinking is contained in loop C (R10)', () => {
+  it('deliberation survives, the promoted payload does not', async () => {
+    // attempt 1: think deliberativo + answer vacio → empty retry; attempt 2 (retry):
+    // think = SOLO la llamada → promocion. El thinking entregado conserva la
+    // deliberacion del attempt 1 y NO el payload promovido del attempt 2.
+    const sender = scriptedSender(turnOf(thinkFrame(BRACKET_CALL)));
+    const res = await runNonStream(turnOf(thinkFrame('planning the read step first')), sender);
+
+    assert.equal(sender.calls.length, 1, 'the empty retry, nothing more');
+    assert.equal(res.statusCode, 200);
+    const blocks = res.body?.content || [];
+    assert.deepEqual(blocks.filter(b => b.type === 'tool_use').map(b => b.name), ['read_file']);
+    const thinkingText = blocks.filter(b => b.type === 'thinking').map(b => b.thinking).join('');
+    assert.match(thinkingText, /planning the read step first/, 'prior deliberation must survive');
+    assert.doesNotMatch(thinkingText, /TOOL CALL/, 'the promoted payload leaked into thinking');
+    assert.doesNotMatch(thinkingText, /read_file/, 'the promoted payload leaked into thinking');
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+});
+
+describe('give-up and degraded-delivery paths actually log (R11)', () => {
+  it('stream: tool_error after streamed prose → break warn + degraded-delivery warn, no retry', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('should never be consumed')));
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runStream(
+        turnOf(answerFrame('Working on it.\n'), answerFrame('[TOOL CALL]{"name":"read_file","arguments":{')),
+        sender
+      );
+    });
+
+    assert.equal(sender.calls.length, 0, 'tool_error after prose must not retry');
+    assert.ok(
+      warns.some(l => /已见正文后本轮出现 tool_error/.test(l)),
+      `expected the tool_error-after-prose break warn, got:\n${warns.join('\n')}`
+    );
+    assert.ok(
+      warns.some(l => /工具协议出错但已产出内容/.test(l)),
+      `expected the degraded-delivery warn, got:\n${warns.join('\n')}`
+    );
+    assert.match(res.output, /"type":"message_stop"/);
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+});
+
+describe('searchTable injection never poisons the think settle (R12)', () => {
+  it('stream: web_search table streams into thinking, promotion still fires', async () => {
+    const webSearchFrame = `data: ${JSON.stringify({
+      choices: [{
+        delta: { name: 'web_search', phase: 'answer', extra: { web_search_info: [{ title: 'Qwen docs', url: 'https://q.example', hostname: 'q.example' }] } },
+        finish_reason: null
+      }]
+    })}\n\n`;
+    const sender = scriptedSender(turnOf(answerFrame('retry would consume this')));
+    const res = await runStream(() => Readable.from([webSearchFrame, thinkFrame(BRACKET_CALL), STOP]), sender);
+
+    assert.equal(sender.calls.length, 0, 'the injected searchTable must not count as model think content');
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+    assert.match(res.output, /Qwen docs/, 'the searchTable must actually have streamed into thinking');
+    assert.match(res.output, /"stop_reason":"tool_use"/);
   });
 });
 

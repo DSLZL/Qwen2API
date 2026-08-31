@@ -1344,6 +1344,31 @@ test('reparacion: loguea una sola linea de tipo, jamas el contenido del payload'
   assert.doesNotMatch(repairLines[0], /en-123/, 'el contenido del payload se filtro al log')
 })
 
+test('R13: el reason de invalid_json se sanitiza en el LOG; el objeto conserva el reason completo', () => {
+  // Node 24 (V8) incrusta el payload en e.message: "Unexpected token 'S', ..."...SENTINEL..."
+  // is not valid JSON". El objeto de error DEBE conservarlo (hints/tests); el log NO.
+  const { logger } = require('../src/utils/logger.js')
+  const saved = logger.warn
+  const lines = []
+  logger.warn = (msg) => { lines.push(String(msg)) }
+  let result
+  try {
+    result = parseToolCallsFromText(
+      '[TOOL CALL]{"name":"read_file","arguments":{"a":SENTINEL_XYZ}}[END TOOL CALL]',
+      { allowedToolNames: ['read_file'] }
+    )
+  } finally {
+    logger.warn = saved
+  }
+  assert.equal(result.toolCalls.length, 0)
+  assert.equal(result.errors[0].type, 'invalid_json')
+  assert.match(String(result.errors[0].reason), /Unexpected token/, 'el objeto debe conservar el reason original')
+  const failLine = lines.find(l => /解析 tool_call 负载失败/.test(l))
+  assert.ok(failLine, `expected the parse-failure log line:\n${lines.join('\n')}`)
+  assert.doesNotMatch(failLine, /SENTINEL/, 'el eco del payload se filtro al log')
+  assert.match(failLine, /Unexpected token/, 'el prefijo de tipo de error debe sobrevivir en el log')
+})
+
 test('reparacion: JSON valido no emite linea de reparacion', () => {
   const { logger } = require('../src/utils/logger.js')
   const saved = logger.warn
