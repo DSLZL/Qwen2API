@@ -289,7 +289,8 @@ const buildAgentRetryHint = (reason = 'incomplete') => {
     bare: 'The previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.',
     invalid_control: 'The previous attempt used a malformed or mixed Agent completion wrapper.',
     invalid_tool_call: 'The previous attempt contained an invalid, truncated, or unknown tool call.',
-    required_tool: 'The previous attempt violated tool_choice and did not call the required tool.'
+    required_tool: 'The previous attempt violated tool_choice and did not call the required tool.',
+    intercepted: `Your tool call did not reach the client. Re-emit it now using EXACTLY the \`${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE}\` format as the first content of your answer — never any other format.`
   }[reason] || 'The previous attempt did not produce a valid Agent turn.'
 
   return [

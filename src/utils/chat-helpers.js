@@ -514,12 +514,16 @@ const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
  */
 const createUpstreamDeltaNormalizer = () => {
     let summaryThoughtCount = 0
-    return (delta) => {
+    const normalize = (delta) => {
         if (!delta) return null
 
         // Defect A: Drop Qwen's own tool-registry results (role="function").
         // These are upstream injections, never the assistant's answer.
+        // Defect A protects OUR stream; the model's context still saw the platform's
+        // injection. The dropped names are the live evidence of that interception,
+        // so surface them for retry decisions instead of only logging.
         if (delta.role === 'function') {
+            normalize.interceptedToolNames.push(delta.name || 'unknown')
             logger.warn(
                 `Dropped upstream role:function delta with phase "${delta.phase}" and name "${delta.name || 'unknown'}"`,
                 'UPSTREAM_NORMALIZER'
@@ -557,6 +561,10 @@ const createUpstreamDeltaNormalizer = () => {
             content
         }
     }
+    // 附着在归一化函数上的拦截信号：每丢一帧 role:function 就记一个名字。
+    // 调用签名不变——不读这个属性的消费者完全不受影响。
+    normalize.interceptedToolNames = []
+    return normalize
 }
 
 module.exports = {

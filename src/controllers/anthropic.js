@@ -800,6 +800,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // 以前任何一个工具错误都会让全部补偿失效并直接 502。可是被编造的工具名恰恰是
     // 最容易纠正的错误：把允许的名字摆在模型面前即可。
     if (currentToolErrors().length > 0) return 'tool_error';
+    // 平台把模型的原生工具调用吃掉时，我们收到的只剩 role:function 丢弃帧和一段
+    // 叙述失败的散文。丢弃帧就是拦截的现场证据：有丢弃、零工具调用、且本请求
+    // 确实带工具 → 值得用规范标记提示模型重发一次。
+    if (hasTools && normalizeDelta.interceptedToolNames.length > 0) return 'intercepted';
     if (hasTools && looksLikeUnexecutedToolAction(visibleText) && !terminalFinish()) {
       return 'missing_tool';
     }
@@ -811,6 +815,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     if (reason === 'required') return buildRetryHint(toolChoice);
     if (reason === 'missing_tool') return buildMissingToolRetryHint();
     if (reason === 'empty') return buildEmptyOutputRetryHint();
+    if (reason === 'intercepted') return buildAgentRetryHint('intercepted');
     return buildToolErrorRetryHint(currentToolErrors(), allowedToolNames);
   };
 
@@ -820,6 +825,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let currentUpstream = upstream;
   let attemptsMade = 0;
   let retriedAfterVisibleText = false;
+  let interceptionRetried = false;
   let nativeToolCalls;
   let hasEmittedToolCalls;
 
@@ -858,6 +864,11 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     const retryReason = decideRetryReason(hasEmittedToolCalls);
     if (!retryReason || attemptsMade >= maxAttempts) break;
 
+    // 拦截重试整个请求只允许一次：第二次拦截说明提示没被采纳，继续循环只会把更多
+    // 叙述散文拼进客户端的流。原样交付比死循环好。注意这个上限独立于下面的
+    // 已见正文守卫 —— 无叙述的拦截（零可见正文）也必须停在一次。
+    if (retryReason === 'intercepted' && interceptionRetried) break;
+
     // 本控制器是边收边发的：正文一产生就写进客户端的流（OpenAI 路径把裸正文扣在门禁
     // 内，所以它可以随便重试）。因此一旦写过正文，再重试就会把两段输出拼在一起。
     //
@@ -868,13 +879,21 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       // tool_error 是唯一一种"这一轮本身就是垃圾"的拒绝理由：模型复述工具协议时，
       // 回显里的字面标签必然解析失败。此时重试只会把第二轮拼在已经发出去的第一轮
       // 后面，客户端看到同一段垃圾两遍。required / missing_tool 不受影响。
+      // intercepted 消费的正是这一次"已见正文后的补偿"名额：叙述已经streamed出去，
+      // 但迟到的 tool_use 仍然胜过一个死掉的会话。
       if (retryReason === 'tool_error') break;
       if (retriedAfterVisibleText) break;
       retriedAfterVisibleText = true;
     }
+    if (retryReason === 'intercepted') interceptionRetried = true;
 
+    // intercepted 的日志必须带上被丢弃的名字：生产环境里这行紧跟着一串
+    // UPSTREAM_NORMALIZER 丢弃日志出现，是验证这条防御真的触发的唯一抓手。
+    const rejectionDetail = retryReason === 'intercepted'
+      ? `${retryReason}; dropped: ${normalizeDelta.interceptedToolNames.join(', ')}`
+      : retryReason;
     logger.warning?.(
-      `Anthropic Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${retryReason})`,
+      `Anthropic Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${rejectionDetail})`,
       'ANTHROPIC'
     );
 
@@ -1092,6 +1111,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 以前任何一个工具错误都会让全部补偿失效并直接 502。被编造的工具名恰恰是最容易
     // 纠正的错误：把允许的名字摆在模型面前即可。
     if (toolErrors.length > 0) return 'tool_error';
+    // 与流式分支同一条防御：role:function 丢弃帧 + 零工具调用 + 本请求带工具，
+    // 说明平台吃掉了模型的原生调用，用规范标记提示重发一次。
+    if (hasTools && normalizeDelta.interceptedToolNames.length > 0) return 'intercepted';
     if (hasTools && looksLikeUnexecutedToolAction(cleanedText) && !terminalFinish()) {
       return 'missing_tool';
     }
@@ -1103,13 +1125,25 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const maxAttempts = Math.max(1, Number(config.agentTurnMaxAttempts) || 1);
   let attemptsMade = 1;
   let streamBrokeOnRetry = false;
+  let interceptionRetried = false;
 
   while (attemptsMade < maxAttempts) {
     const retryReason = decideRetryReason();
     if (!retryReason) break;
 
+    // 与流式分支同一条纪律：拦截重试整个请求只允许一次。第二次拦截说明提示
+    // 没被采纳，把叙述散文按正常回答交付，别再烧尝试次数。
+    if (retryReason === 'intercepted') {
+      if (interceptionRetried) break;
+      interceptionRetried = true;
+    }
+
+    // intercepted 带上被丢弃的名字（同流式分支：生产环境验证防御触发的抓手）。
+    const rejectionDetail = retryReason === 'intercepted'
+      ? `${retryReason}; dropped: ${normalizeDelta.interceptedToolNames.join(', ')}`
+      : retryReason;
     logger.warning?.(
-      `Anthropic 非流式 Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${retryReason})`,
+      `Anthropic 非流式 Agent attempt ${attemptsMade}/${maxAttempts} 被拒绝 (${rejectionDetail})`,
       'ANTHROPIC'
     );
 
@@ -1119,7 +1153,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         ? buildMissingToolRetryHint()
         : (retryReason === 'empty'
           ? buildEmptyOutputRetryHint()
-          : buildToolErrorRetryHint(toolErrors, allowedToolNames)));
+          : (retryReason === 'intercepted'
+            ? buildAgentRetryHint('intercepted')
+            : buildToolErrorRetryHint(toolErrors, allowedToolNames))));
 
     let retryResp;
     try {
@@ -1135,6 +1171,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     const before = answerContent;
     // 每轮全新的累加器，否则上一轮的错误会一直跟着走。
     nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames });
+    // normalizeDelta 在本分支是跨 attempt 共享的（已知缺陷，unify-agent-loop 规格
+    // 负责修）。拦截计数必须按轮归零，否则上一轮的丢弃会把成功的重试再判成拦截。
+    normalizeDelta.interceptedToolNames.length = 0;
     upstreamFinishReason = null;
     const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
     upstreamCompleted = retryResult.completed;
