@@ -657,18 +657,6 @@ class Account {
         return false
     }
 
-    // 更新销毁方法，清除定时器
-    destroy() {
-        if (this.saveInterval) {
-            clearInterval(this.saveInterval)
-        }
-        if (this.refreshInterval) {
-            clearInterval(this.refreshInterval)
-        }
-    }
-
-
-
     /**
      * 生成 Markdown 表格
      * @param {Array} websites - 网站信息数组
