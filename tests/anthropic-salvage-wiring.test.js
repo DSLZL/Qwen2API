@@ -83,13 +83,16 @@ describe('production wiring: Anthropic request → toolSchemas → salvage gate 
 
   it('a duplicated tool name disables its schema — ambiguous ⇒ no salvage (fail closed)', async () => {
     upstreamFactory = () => Readable.from([answerFrame(INCIDENT3), STOP]);
+    // Orden deliberado: el duplicado PERMISIVO va al final — un last-wins dejaria
+    // pasar el salvage con su schema y este test lo cazaria; fail-closed no abona
+    // ninguno de los dos.
     const req = {
       body: {
         model: 'qwen3-coder-plus',
         max_tokens: 512,
         stream: false,
         messages: [{ role: 'user', content: 'lista los archivos' }],
-        tools: [BASH_TOOL, { ...BASH_TOOL, input_schema: { type: 'object', properties: {} } }]
+        tools: [{ ...BASH_TOOL, input_schema: { type: 'object', properties: {} } }, BASH_TOOL]
       }
     };
     const res = createRes();
