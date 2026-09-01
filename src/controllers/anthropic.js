@@ -1592,12 +1592,23 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     }
   }
 
-  if (hasTools && toolCalls.length === 0 && (toolErrors.length > 0 || requiresToolCall(toolChoice))) {
+  // 残渣纯度判据（review loop 2）：剥离已经跑完（上面的 layer-3 块），此处的
+  // cleanedText 就是将要进 content blocks 的交付文本。整轮登记过残渣、剥后什么
+  // 都不剩（bare 负载 debris、孤儿闭标记）→ 这轮和 tool_error 轮是同一类失败：
+  // 502 invalid_tool_call_error，绝不交付 content: [] 的空消息，也绝不把裸协议
+  // 当回答发出去（frozen matrix：never an empty-content message / raw protocol
+  // never reaches a client）。剥后还有真实正文的轮子照常交付 —— 一句散文 + 一个
+  // 迷路的闭标记绝不能升级成 502。
+  const residueOnlyTurn = hasTools && roundResidueSpans.length > 0 && !cleanedText.trim();
+  if (hasTools && toolCalls.length === 0 &&
+      (toolErrors.length > 0 || requiresToolCall(toolChoice) || residueOnlyTurn)) {
     // 这个细节以前存在于 errors 里却被丢掉，于是三种截然不同的原因挤进同一句
     // 不透明的报错，而 unknown_tool 连一行日志都不留。
     const detail = toolErrors.length
       ? describeToolErrors(toolErrors)
-      : 'tool_choice=required 未触发任何工具调用';
+      : (requiresToolCall(toolChoice)
+        ? 'tool_choice=required 未触发任何工具调用'
+        : '整轮内容只有协议残渣，剥离后为空');
     // logger 上只有 warn，没有 warning —— 旧的 logger.warning?.() 是静默空操作。
     logger.warn(
       `Anthropic 非流式工具协议失败，${attemptsMade}/${maxAttempts} 次尝试后放弃 (${detail})`,

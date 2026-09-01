@@ -286,6 +286,27 @@ describe('blind-hunter edges: nameHint provenance and the envelope repair path',
 });
 
 describe('regression pins around the salvage', () => {
+  it('orphan closers register as residue, but fenced/inline-code closers never do', () => {
+    // El registro de cierres huerfanos respeta el mismo code tracker que los
+    // triggers: un ejemplo documentado jamas es residuo.
+    const loose = parseToolCallsFromText('prosa antes\n[END TOOL CALL]\nprosa después', {
+      allowedToolNames: ALLOWED,
+      toolSchemas: SCHEMAS
+    });
+    assert.equal(loose.residueSpans.length, 1);
+    assert.equal(loose.residueSpans[0].text, '[END TOOL CALL]');
+    const stripped = stripToolCallResidue(loose.cleanedText, loose.residueSpans);
+    assert.match(stripped, /prosa antes/);
+    assert.match(stripped, /prosa después/);
+    assert.doesNotMatch(stripped, /END TOOL CALL/);
+
+    const fenced = parseToolCallsFromText('Ejemplo:\n```\n[END TOOL CALL]\n```\nY en inline: `[END TOOL CALL]` listo.', {
+      allowedToolNames: ALLOWED,
+      toolSchemas: SCHEMAS
+    });
+    assert.equal(fenced.residueSpans.length, 0, 'code-context closers are documentation by construction');
+  });
+
   it('code-fence immunity: a fenced incident-3 span stays documentation, no salvage, no spans', () => {
     const fenced = 'Example of the broken form:\n```\n[TOOL_CALL]Bash{command: "ls"}\n[END TOOL CALL]\n```\nDone.';
     const result = parseToolCallsFromText(fenced, { allowedToolNames: ALLOWED, toolSchemas: SCHEMAS });
@@ -717,19 +738,53 @@ describe('loop C: delivery strip is span-gated and round-consistent', () => {
     // sin sobre, desbalanceado y con forma de leak → debris REGISTRADO con cero
     // toolErrors → malformed_protocol agota su retry → sin este fix la entrega
     // pelaba el residuo DESPUES del juicio de vacio y salia content: [] con 200.
-    // El juicio de vacio de C debe correr sobre el texto YA pelado, como B.
+    // El juicio de residue-only de C corre sobre el texto YA pelado — el mismo
+    // que iria a los content blocks — y toma el 502 de clase invalid_tool_call.
     const DEBRIS = '{"name": "Bash", "arguments": {"command": "ls"';
     const sender = scriptedSender(turnOf(answerFrame(DEBRIS)));
     const res = await runNonStream(turnOf(answerFrame(DEBRIS)), sender);
 
     assert.equal(sender.calls.length, 1, 'one malformed_protocol retry, then give up');
     assert.equal(res.statusCode, 502, 'an all-residue turn has no deliverable content');
-    assert.equal(res.body?.error?.type, 'api_error');
+    assert.equal(res.body?.error?.type, 'invalid_tool_call_error');
     assert.notEqual(
       Array.isArray(res.body?.content) && res.body.content.length === 0 && res.statusCode === 200,
       true,
       'an empty content array with 200 breaks the client parse'
     );
+  });
+
+  it('an orphan-closer-only turn 502s — the raw closer never reaches the client', async () => {
+    // `[END TOOL CALL]` solo no enciende ningun trigger (el regex no reconoce
+    // `[END`): cruzaba el fast path como texto y se ENTREGABA crudo tras agotar
+    // malformed_protocol (verificado pre-fix: 200 + content=[{text:"[END TOOL
+    // CALL]"}]). El cierre huerfano es residuo inequivoco: se registra en el
+    // ledger, la entrega lo pela, y un turno que era 100% cierre queda vacio →
+    // 502 invalid_tool_call_error.
+    const sender = scriptedSender(turnOf(answerFrame('[END TOOL CALL]')));
+    const res = await runNonStream(turnOf(answerFrame('[END TOOL CALL]')), sender);
+
+    assert.equal(res.statusCode, 502, 'a closer-only turn has no deliverable content');
+    assert.equal(res.body?.error?.type, 'invalid_tool_call_error');
+    const text = (res.body?.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    assert.doesNotMatch(text, /END TOOL CALL/, 'raw protocol never reaches a client under any outcome');
+  });
+
+  it('prose + trailing orphan closer delivers the prose with the closer removed — never a 502', async () => {
+    // La linea que NO se puede cruzar en la otra direccion: prosa real + un
+    // cierre extraviado sigue siendo una respuesta. Se pela el cierre, se
+    // entrega la prosa, status 200 — containsOrphanProtocolResidue sigue
+    // encendiendo el retry (detECCION intacta), pero agotado el retry la
+    // entrega jamas convierte prosa en 502.
+    const PROSE_PLUS_CLOSER = 'El reporte quedó guardado en disco.\n[END TOOL CALL]';
+    const sender = scriptedSender(turnOf(answerFrame(PROSE_PLUS_CLOSER)));
+    const res = await runNonStream(turnOf(answerFrame(PROSE_PLUS_CLOSER)), sender);
+
+    assert.equal(res.statusCode, 200, 'prose must never be upgraded into a 502');
+    const text = (res.body?.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    assert.match(text, /El reporte quedó guardado en disco\./);
+    assert.doesNotMatch(text, /END TOOL CALL/, 'the stray closer is stripped at delivery');
+    assert.equal(res.body.stop_reason, 'end_turn');
   });
 
   it('C incident-3 non-stream (first-content): the whole-text path salvages the same call', async () => {

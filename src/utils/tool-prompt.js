@@ -958,6 +958,39 @@ const logSyntheticRejected = (reason) => {
   warnTool(`裸负载抢救被拒绝（${reason}），按正文放行`);
 };
 
+/**
+ * 孤儿方括号闭标记的登记（review loop 2）：`[END TOOL CALL]` 独自出现在正文里时
+ * 从不进扫描循环（触发器正则不认 `[END`），却是**无歧义**的协议残渣 —— 合法回答
+ * 里出现它的概率≈0，写侧的 neutraliseResultMarkers 还在结果正文里主动打瘸它。
+ * 在最终 cleanedText 上补一遍登记，交付层照登记位置剥掉；只登记、绝不改动
+ * cleanedText —— 检测输入（containsOrphanProtocolResidue 据它点火 malformed_protocol
+ * 重试）保持逐字节原样，剥离仍然只发生在交付点。
+ *
+ * 两条豁免：（1）围栏/行内代码里的例子按构造不是残渣（同一套 code tracker，
+ * 在**交付文本**上走 —— 读者看到的就是这份）；（2）已登记 span 内部的闭标记
+ * 不重复登记 —— 重叠条目会让降序剥离互相拆台（先剥内层，外层校验就配不上了）。
+ * @param {string} text - 最终 cleanedText（登记坐标系）
+ * @param {Array<{text: string, at: number}>} spans - 既有登记簿，就地追加
+ */
+const recordOrphanBracketClosers = (text, spans) => {
+  if (!TOOL_CALL_CLOSE_BRACKET_SCAN_RE.test(text)) return;
+  const tracker = createCodeContextTracker();
+  let from = 0;
+  for (;;) {
+    const match = text.slice(from).match(TOOL_CALL_CLOSE_BRACKET_SCAN_RE);
+    if (!match) return;
+    const at = from + match.index;
+    tracker.consume(text.slice(from, at));
+    const insideRecorded = spans.some(span =>
+      typeof span.text === 'string' && at >= span.at && at < span.at + span.text.length);
+    if (!tracker.inCode() && !insideRecorded) {
+      spans.push({ text: match[0], at });
+    }
+    tracker.consume(text.slice(at, at + match[0].length));
+    from = at + match[0].length;
+  }
+};
+
 const createToolCallObject = (payload, index = 0, id = null) => ({
   index,
   id: id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
@@ -1205,9 +1238,13 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     : null;
   // 快路径必须与识别器同步：正则触发器**或**（抢救开启时）答案开头的裸负载形状，
   // 二者都算“可能有调用”。只测正则的话，合成开端在这里就被拦掉了。
+  // 快路径的文本照样要登记孤儿闭标记（`[END TOOL CALL]` 不点火任何触发器，
+  // 正是从这里原样穿过的）—— cleanedText 本身逐字节不动。
   if (typeof fullText !== 'string' ||
       !(TOOL_CALL_TRIGGER_RE.test(fullText) || (salvage && isLeakedToolPayloadShape(fullText)))) {
-    return { cleanedText: fullText || '', toolCalls: [], errors: [], warnings: [], residueSpans: [] };
+    const fastPathSpans = [];
+    if (typeof fullText === 'string') recordOrphanBracketClosers(fullText, fastPathSpans);
+    return { cleanedText: fullText || '', toolCalls: [], errors: [], warnings: [], residueSpans: fastPathSpans };
   }
 
   const toolCalls = [];
@@ -1425,14 +1462,17 @@ const parseToolCallsFromText = (fullText, options = {}) => {
   releaseProse(fullText.slice(position));
   // cleanedText 收尾 trim：登记的落点随前导空白平移（span 自身以非空白开头，
   // 不可能整段落在被削掉的前导区；尾部被削的贴边 span 由 stripToolCallResidue
-  // 的前缀容差处理）。
+  // 的前缀容差处理）。孤儿闭标记在**最终交付文本**上补登记（坐标系一致）。
   const leadingTrim = cleanedText.length - cleanedText.trimStart().length;
+  const trimmedCleanedText = cleanedText.trim();
+  const adjustedSpans = residueSpans.map(span => ({ ...span, at: span.at - leadingTrim }));
+  recordOrphanBracketClosers(trimmedCleanedText, adjustedSpans);
   return {
-    cleanedText: cleanedText.trim(),
+    cleanedText: trimmedCleanedText,
     toolCalls,
     errors,
     warnings,
-    residueSpans: residueSpans.map(span => ({ ...span, at: span.at - leadingTrim }))
+    residueSpans: adjustedSpans
   };
 };
 
