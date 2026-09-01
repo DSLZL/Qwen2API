@@ -712,6 +712,26 @@ describe('loop C: delivery strip is span-gated and round-consistent', () => {
     assert.doesNotMatch(text, /TOOL_CALL/i, 'residue stripped despite the tag shift');
   });
 
+  it('a debris-only turn strips to empty and 502s — never an empty-content message', async () => {
+    // Repro del corner item-9 (review loop 2, verificado por ejecucion): payload
+    // sin sobre, desbalanceado y con forma de leak → debris REGISTRADO con cero
+    // toolErrors → malformed_protocol agota su retry → sin este fix la entrega
+    // pelaba el residuo DESPUES del juicio de vacio y salia content: [] con 200.
+    // El juicio de vacio de C debe correr sobre el texto YA pelado, como B.
+    const DEBRIS = '{"name": "Bash", "arguments": {"command": "ls"';
+    const sender = scriptedSender(turnOf(answerFrame(DEBRIS)));
+    const res = await runNonStream(turnOf(answerFrame(DEBRIS)), sender);
+
+    assert.equal(sender.calls.length, 1, 'one malformed_protocol retry, then give up');
+    assert.equal(res.statusCode, 502, 'an all-residue turn has no deliverable content');
+    assert.equal(res.body?.error?.type, 'api_error');
+    assert.notEqual(
+      Array.isArray(res.body?.content) && res.body.content.length === 0 && res.statusCode === 200,
+      true,
+      'an empty content array with 200 breaks the client parse'
+    );
+  });
+
   it('C incident-3 non-stream (first-content): the whole-text path salvages the same call', async () => {
     const sender = scriptedSender();
     const res = await runNonStream(turnOf(answerFrame(INCIDENT3)), sender);

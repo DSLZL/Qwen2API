@@ -1573,6 +1573,25 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     roundResidueSpans = narrationFallback.spans;
   }
 
+  // salvage-3 layer 3：交付轮登记过残渣才动交付文本（review loop 1，条目 9：
+  // 门挂在 residueSpans 上，不挂 toolErrors —— narrationFallback 轮零错误也可能
+  // 携带残渣）。位置驱动：在**原始**文本上按登记落点剥，再剥 agent tag（与 B
+  // 同序）。检测与重试判定（decideRetryReason / containsOrphanProtocolResidue）
+  // 早已在未剥离文本上跑完 —— 剥离只发生在交付点。剥离必须在下面的空判据
+  // **之前**（review loop 2）：一整轮只有 debris 残渣（无信封负载配不平 ——
+  // 有登记、零 toolErrors）时，剥后为空要走「无正文」的 502，绝不能交付
+  // content: [] 的空消息（frozen matrix：never an empty-content message；
+  // 复现脚本 repro-item9-corner.js 钉死过 200 + 空数组的老结局）。
+  // Ask-first 决议：静默剥离、日志留痕，不注入任何替代文本。零残渣轮逐字节
+  // 保持今天的交付。
+  if (hasTools && roundResidueSpans.length > 0) {
+    const residueFree = stripAgentTags(stripToolCallResidue(roundRawCleanedText, roundResidueSpans));
+    if (residueFree !== cleanedText) {
+      cleanedText = residueFree;
+      logger.warn('Anthropic 非流式交付前按登记位置剥离协议残渣，零协议字节交付', 'ANTHROPIC');
+    }
+  }
+
   if (hasTools && toolCalls.length === 0 && (toolErrors.length > 0 || requiresToolCall(toolChoice))) {
     // 这个细节以前存在于 errors 里却被丢掉，于是三种截然不同的原因挤进同一句
     // 不透明的报错，而 unknown_tool 连一行日志都不留。
@@ -1613,20 +1632,6 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       type: 'error',
       error: { type: 'api_error', message: '上游流在结束标记前断开' }
     });
-  }
-
-  // salvage-3 layer 3：交付轮登记过残渣才动交付文本（review loop 1，条目 9：
-  // 门挂在 residueSpans 上，不挂 toolErrors —— narrationFallback 轮零错误也可能
-  // 携带残渣）。位置驱动：在**原始**文本上按登记落点剥，再剥 agent tag（与 B
-  // 同序）。检测与重试判定（decideRetryReason / containsOrphanProtocolResidue）
-  // 早已在未剥离文本上跑完 —— 剥离只发生在交付点。Ask-first 决议：静默剥离、
-  // 日志留痕，不注入任何替代文本。零残渣轮逐字节保持今天的交付。
-  if (hasTools && roundResidueSpans.length > 0) {
-    const residueFree = stripAgentTags(stripToolCallResidue(roundRawCleanedText, roundResidueSpans));
-    if (residueFree !== cleanedText) {
-      cleanedText = residueFree;
-      logger.warn('Anthropic 非流式交付前按登记位置剥离协议残渣，零协议字节交付', 'ANTHROPIC');
-    }
   }
 
   if (promptTokens === 0 && completionTokens === 0) {
