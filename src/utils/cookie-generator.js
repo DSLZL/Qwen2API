@@ -21,8 +21,8 @@ function lzwCompress(data, bits, charFunc) {
 
     let dict = {};
     let dictToCreate = {};
-    let c = '';
-    let wc = '';
+    let c;
+    let wc;
     let w = '';
     let enlargeIn = 2;
     let dictSize = 3;
@@ -206,7 +206,8 @@ function lzwCompress(data, bits, charFunc) {
 
         enlargeIn--;
         if (enlargeIn === 0) {
-            enlargeIn = Math.pow(2, numBits);
+            // The in-loop twin also resets enlargeIn here; in this flush block that
+            // reset is a dead store — enlargeIn is never read again, only numBits is.
             numBits++;
         }
     }

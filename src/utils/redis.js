@@ -23,7 +23,6 @@ const REDIS_CONFIG = {
 
 // 连接状态
 let redis = null
-let isConnecting = false
 let connectionPromise = null
 let lastActivity = 0
 let idleTimer = null
@@ -233,14 +232,12 @@ const connectRedis = async () => {
 
   if (redis && ['connect', 'connecting', 'reconnecting'].includes(redis.status)) {
     if (!connectionPromise) {
-      isConnecting = true
       connectionPromise = waitForRedisReady(redis)
         .then(client => {
           updateActivity()
           return client
         })
         .finally(() => {
-          isConnecting = false
           connectionPromise = null
         })
     }
@@ -252,7 +249,6 @@ const connectRedis = async () => {
     return connectionPromise
   }
 
-  isConnecting = true
   connectionPromise = (async () => {
     let newRedis = null
 
@@ -282,7 +278,6 @@ const connectRedis = async () => {
       logger.error('Redis连接失败', 'REDIS', '', error)
       throw error
     } finally {
-      isConnecting = false
       connectionPromise = null
     }
   })()
@@ -309,7 +304,6 @@ const disconnectRedis = async () => {
         redis = null
       }
 
-      isConnecting = false
       connectionPromise = null
     }
   }

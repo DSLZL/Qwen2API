@@ -29,6 +29,7 @@ const {
   parseAgentControlText,
   createAgentControlStreamParser
 } = require('../src/utils/agent-turn.js')
+const { logger } = require('../src/utils/logger.js')
 
 test.after(() => {
   require('../src/utils/account.js').destroy()
@@ -78,6 +79,55 @@ test('phase-less answer content is not silently discarded', () => {
     phase: 'think',
     content: 'thinking'
   })
+})
+
+// Defect A: Upstream role:"function" deltas are Qwen's own tool results, not the assistant
+test('Defect A: upstream role:function deltas are dropped', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  // Qwen injects tool-registry results as role:"function" deltas with content like "Tool X does not exists."
+  const result = normalize({
+    role: 'function',
+    phase: 'answer',
+    name: 'read_file',
+    content: 'Tool read_file does not exists.'
+  })
+  assert.equal(result, null, 'role:function delta should be dropped, not emitted as text')
+})
+
+test('Defect A: role:function with phase:code_interpreter is dropped', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  // Sandbox results from Qwen also use role:function
+  const result = normalize({
+    role: 'function',
+    phase: 'code_interpreter',
+    extra: { tool_result: 'some output' }
+  })
+  assert.equal(result, null, 'role:function sandbox result should be dropped')
+})
+
+test('Defect A: normal role:assistant answers pass through', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  const result = normalize({
+    role: 'assistant',
+    phase: 'answer',
+    content: 'Here is the answer'
+  })
+  assert.deepEqual(result, {
+    phase: 'answer',
+    content: 'Here is the answer'
+  }, 'normal assistant messages should pass through unchanged')
+})
+
+test('Defect A: thinking deltas pass through even with no role', () => {
+  const normalize = createUpstreamDeltaNormalizer()
+  const result = normalize({
+    phase: 'think',
+    content: 'thinking about this...'
+  })
+  assert.deepEqual(result, {
+    phase: 'think',
+    content: 'thinking about this...'
+  }, 'thinking deltas should pass through')
 })
 
 test('finish reasons preserve truncation instead of reporting normal completion', () => {
@@ -164,25 +214,38 @@ test('OpenAI stream preserves length, accepts clean EOF and rejects transport ab
 test('thinking-only Agent turns retry once and recover visible output', async () => {
   let openAIRetries = 0
   const openAIRes = createMockResponse()
-  await handleStreamResponse(
-    openAIRes,
-    Readable.from(['data: {"choices":[{"delta":{"phase":"think","content":"planning"},"finish_reason":null}]}\n\n']),
-    true,
-    false,
-    { messages: [{ role: 'user', content: 'finish the task' }] },
-    {
-      sendChatRequest: async () => {
-        openAIRetries += 1
-        return {
-          status: true,
-          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"recovered"},"finish_reason":null}]}\n\n'])
+  // R11d: la ruta legacy (sin has_tools) pasa por chat.js:831 — antes un
+  // logger.warning?.() mudo; ahora el retry de compensacion debe dejar linea.
+  const warnLines = []
+  const savedWarn = logger.warn
+  logger.warn = (msg) => { warnLines.push(String(msg)) }
+  try {
+    await handleStreamResponse(
+      openAIRes,
+      Readable.from(['data: {"choices":[{"delta":{"phase":"think","content":"planning"},"finish_reason":null}]}\n\n']),
+      true,
+      false,
+      { messages: [{ role: 'user', content: 'finish the task' }] },
+      {
+        sendChatRequest: async () => {
+          openAIRetries += 1
+          return {
+            status: true,
+            response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"recovered"},"finish_reason":null}]}\n\n'])
+          }
         }
       }
-    }
-  )
+    )
+  } finally {
+    logger.warn = savedWarn
+  }
   assert.equal(openAIRetries, 1)
   assert.match(openAIRes.output, /recovered/)
   assert.match(openAIRes.output, /"finish_reason":"stop"/)
+  assert.ok(
+    warnLines.some(line => /Agent 首次响应没有正文或工具调用，进行一次补偿重试/.test(line)),
+    `chat.js legacy stream retry must log its compensation line, got:\n${warnLines.join('\n')}`
+  )
 
   let anthropicRetries = 0
   const anthropicRes = createMockResponse()
@@ -206,6 +269,38 @@ test('thinking-only Agent turns retry once and recover visible output', async ()
   assert.equal(anthropicRetries, 1)
   assert.match(anthropicRes.output, /recovered/)
   assert.match(anthropicRes.output, /event: message_stop/)
+})
+
+// R11d: el gemelo non-stream de la ruta legacy (chat.js:1174, otro logger.warning?.()
+// mudo hasta este ciclo) — un turno solo-thinking reintenta una vez y deja linea.
+test('legacy non-stream empty-output retry logs its compensation line', async () => {
+  const warnLines = []
+  const savedWarn = logger.warn
+  logger.warn = (msg) => { warnLines.push(String(msg)) }
+  const res = createMockResponse()
+  try {
+    await handleNonStreamResponse(
+      res,
+      Readable.from(['data: {"choices":[{"delta":{"phase":"think","content":"planning"},"finish_reason":null}]}\n\ndata: [DONE]\n\n']),
+      false,
+      false,
+      'qwen-test',
+      { messages: [{ role: 'user', content: 'finish the task' }] },
+      {
+        sendChatRequest: async () => ({
+          status: true,
+          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"recovered"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'])
+        })
+      }
+    )
+  } finally {
+    logger.warn = savedWarn
+  }
+  assert.match(res.output, /recovered/)
+  assert.ok(
+    warnLines.some(line => /Agent 首次响应没有正文或工具调用，进行一次补偿重试/.test(line)),
+    `chat.js legacy non-stream retry must log its compensation line, got:\n${warnLines.join('\n')}`
+  )
 })
 
 test('strict OpenAI Agent gate streams reasoning but keeps rejected answer attempts isolated', async () => {
@@ -565,6 +660,43 @@ test('a standalone tool call emitted in the thinking phase remains executable', 
   assert.doesNotMatch(res.output, /<tool_call>/)
 })
 
+// Pin de las guardas de promocion del loop A (evidencia read-only, sin cambio de src):
+// la promocion desde thinking exige cleanedText VACIO — un call flanqueado por prosa
+// de razonamiento es una cita/deliberacion, no una accion. Los loops B y C copian
+// estas guardas (openai-agent-runtime.js:232-243) y les SUMAN dos conjuntos mas
+// estrictos que A no tiene — allowlist no vacia (fail closed) y cero tool errors del
+// lado answer (spec toolcall-salvage-2 + review R1); si alguien relaja las de A aqui,
+// este test se pone rojo antes de que la relajacion se propague por paridad.
+test('A-parity pin: a think call flanked by reasoning prose is NOT promoted', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      'data: {"choices":[{"delta":{"phase":"think","content":"<tool_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{}}</tool_call> but let me weigh it first"},"finish_reason":"stop"}]}\n\n'
+    ]),
+    true,
+    false,
+    { messages: [{ role: 'user', content: 'inspect the repository' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['read_file'],
+      sendChatRequest: async () => {
+        retries += 1
+        return {
+          status: true,
+          response: Readable.from(['data: {"choices":[{"delta":{"phase":"answer","content":"<agent_final>done safely</agent_final>"},"finish_reason":"stop"}]}\n\n'])
+        }
+      }
+    }
+  )
+
+  assert.equal(retries, 1, 'non-empty reasoning cleanedText must block promotion and force a retry')
+  assert.doesNotMatch(res.output, /"tool_calls":\[/, 'the quoted think call must never execute')
+  assert.match(res.output, /done safely/)
+})
+
 test('live reasoning never leaks fragmented tool markup before the Agent gate decides', async () => {
   const res = createMockResponse()
   await handleStreamResponse(
@@ -806,9 +938,9 @@ test('externalized Agent context keeps system rules active task and recent tool 
     JSON.stringify({ role: 'system', content: 'SYSTEM_RULE_MUST_SURVIVE' }),
     JSON.stringify({ role: 'user', content: 'ACTIVE_TASK_MUST_SURVIVE: fix and verify the project' }),
     JSON.stringify({ role: 'assistant', content: '<tool_call>{"name":"bash","arguments":{"command":"test"}}</tool_call>' }),
-    JSON.stringify({ role: 'user', content: `<tool_response name="bash">RECENT_PROGRESS_MUST_SURVIVE ${'x'.repeat(5000)}</tool_response>` }),
+    JSON.stringify({ role: 'user', content: `[TOOL RESULT: bash]\nRECENT_PROGRESS_MUST_SURVIVE ${'x'.repeat(5000)}\n[END TOOL RESULT]` }),
     '# Current message',
-    JSON.stringify({ role: 'user', content: '<tool_response name="bash">CURRENT_RESULT_MUST_SURVIVE</tool_response>' }),
+    JSON.stringify({ role: 'user', content: '[TOOL RESULT: bash]\nCURRENT_RESULT_MUST_SURVIVE\n[END TOOL RESULT]' }),
     buildAgentTurnDirective({ afterToolResult: true })
   ].join('\n')
   const result = await externalizeOversizedAgentContext(
@@ -827,6 +959,16 @@ test('externalized Agent context keeps system rules active task and recent tool 
   assert.match(live, /RECENT_PROGRESS_MUST_SURVIVE/)
   assert.match(live, /CURRENT_RESULT_MUST_SURVIVE/)
   assert.match(live, /not a reason to stop after one action/)
+
+  // El lock-step con foldToolMessages hay que afirmarlo SOBRE LA SECCION, no sobre el
+  // prompt entero: ACTIVE_TASK_MUST_SURVIVE tambien aparece en el JSONL crudo de
+  // "Recent Agent history", asi que la asercion global seguia verde con el guard borrado.
+  // Si buildEssentialAgentHistory deja de reconocer [TOOL RESULT: ...], elige un bloque
+  // de resultado como "tarea activa" y esta seccion trae TOOL RESULT.
+  const activeSection = live.slice(live.indexOf('## Active user task')).split('\n# ')[0]
+  assert.match(activeSection, /ACTIVE_TASK_MUST_SURVIVE/, 'la tarea activa real no quedo en su seccion')
+  assert.doesNotMatch(activeSection, /TOOL RESULT/, 'un resultado de herramienta se eligio como tarea activa')
+  assert.doesNotMatch(activeSection, /tool_response/, 'un resultado en formato viejo se eligio como tarea activa')
 
   const recovered = compactAgentContextFallback(original, 8192)
   assert.match(recovered, /SYSTEM_RULE_MUST_SURVIVE/)
@@ -1142,4 +1284,251 @@ test('an echoed <tool_call> in accepted reasoning reaches the client whole', asy
   assert.match(res.output, /Use a /)
   assert.match(res.output, /block next time\./, 'la frase llegó cortada en el tag')
   assert.doesNotMatch(res.output, /upstream_agent|invalid_tool_call/)
+})
+
+// ── Defensa de recuperacion de protocolo en la ruta OpenAI (findings 9 y 10) ──
+// La interceptacion de plataforma (drops role:function) y el protocolo de brackets
+// escrito a medias (residuo huerfano / payload pelado) mataban el turno tambien en
+// /v1/chat/completions: el gate aceptaba la narracion envuelta en <agent_final>
+// como completacion legitima. Ahora ambos son razones de retry con tope compartido.
+
+const { runOpenAIAgentTurn } = require('../src/utils/openai-agent-runtime.js')
+
+const agentAnswerFrame = (content) => `data: ${JSON.stringify({
+  choices: [{ delta: { phase: 'answer', content }, finish_reason: null }]
+})}\n\n`
+const agentInterceptionFrame = (name) => `data: ${JSON.stringify({
+  choices: [{
+    delta: { role: 'function', phase: 'answer', name, content: `Tool ${name} does not exists` },
+    finish_reason: null
+  }]
+})}\n\n`
+const agentTurnStream = (...frames) => Readable.from([
+  ...frames,
+  'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+])
+
+const WRAPPED_NARRATION = '<agent_final>The Bash tool seems unavailable, giving up on the task.</agent_final>'
+const AGENT_BRACKET_CALL = '[TOOL CALL]{"name":"read_file","arguments":{"path":"a.txt"}}[END TOOL CALL]'
+// Leak real #2 (2026-08-31): JSON completo y valido al inicio, closers doblados.
+const AGENT_LEAK = [
+  '{"name": "AskUserQuestion", "arguments": {"questions": [{"question": "Deploy to which environment?", "header": "Env", "options": [{"label": "dev", "description": "staging first"}, {"label": "prod", "description": "straight to production"}], "multiSelect": false}]}}',
+  '[END TOOL CALL]',
+  '[END TOOL CALL]'
+].join('\n')
+
+const runAgentTurn = (initialFrames, sendChatRequest, overrides = {}) => runOpenAIAgentTurn(
+  agentTurnStream(...initialFrames),
+  {
+    has_tools: true,
+    tool_choice: 'auto',
+    allowed_tool_names: ['read_file'],
+    agent_turn_max_attempts: 3,
+    upstream_request_body: { messages: [{ role: 'user', content: 'do the task' }] },
+    sendChatRequest,
+    ...overrides
+  }
+)
+
+test('OpenAI gate: la narracion envuelta tras drops se rechaza como intercepted, no se acepta', () => {
+  const attempt = buildAttempt({
+    controlKind: 'final',
+    visibleText: 'The Bash tool seems unavailable, giving up.',
+    interceptedToolNames: ['Bash']
+  })
+  assert.deepEqual(evaluateAgentTurn(attempt), {
+    accepted: false,
+    finishReason: null,
+    retryReason: 'intercepted'
+  })
+  // Nombre agotado el tope compartido: se entrega por las reglas de siempre.
+  assert.equal(evaluateAgentTurn(attempt, { protocol_recovery_used: true }).accepted, true)
+  // Sin herramientas en juego, los drops no significan nada.
+  assert.equal(evaluateAgentTurn(attempt, { has_tools: false }).accepted, true)
+})
+
+test('OpenAI gate: drops junto a una llamada aceptada no reintenta (drop especulativo benigno)', () => {
+  const attempt = buildAttempt({
+    toolCalls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{}' } }],
+    interceptedToolNames: ['Bash']
+  })
+  assert.deepEqual(evaluateAgentTurn(attempt), {
+    accepted: true,
+    finishReason: 'tool_calls',
+    retryReason: null
+  })
+})
+
+test('OpenAI gate: el leak de protocolo malformado se rechaza; JSON ordinario no', () => {
+  assert.equal(
+    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: AGENT_LEAK })).retryReason,
+    'malformed_protocol'
+  )
+  // JSON sin clave "arguments" al inicio: respuesta normal, cae en bare.
+  assert.equal(
+    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '{"name": "results", "count": 3}' })).retryReason,
+    'bare'
+  )
+})
+
+test('OpenAI loop: turno interceptado reintenta una vez con el hint canonico y recupera', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(result.attempt.toolCalls[0].function.name, 'read_file')
+  assert.equal(sent.length, 1)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /did not reach the client/)
+  assert.ok(hint.includes('[TOOL CALL]'), 'el hint debe ensenar el marcador canonico')
+  assert.doesNotMatch(hint, /<tool_call/i)
+})
+
+test('OpenAI loop: la segunda interceptacion entrega el final envuelto tal cual (tope de uno)', async () => {
+  let sent = 0
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async () => {
+      sent += 1
+      return {
+        status: true,
+        response: agentTurnStream(agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION))
+      }
+    }
+  )
+
+  assert.equal(sent, 1, 'exactamente un retry de recuperacion de protocolo por request')
+  assert.equal(result.ok, true, 'entregar tal cual, no agotar con 429')
+  assert.equal(result.finishReason, 'stop')
+  assert.match(result.attempt.visibleText, /unavailable/)
+})
+
+test('OpenAI loop: el leak malformado reintenta con su hint y recupera tool_calls', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentAnswerFrame(AGENT_LEAK)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(sent.length, 1)
+  assert.match(JSON.stringify(sent[0]), /was NOT executed/)
+})
+
+test('OpenAI loop: required_tool tapa la interceptacion pero el hint lleva el dato clave', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('read_file'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    },
+    { tool_choice: 'required' }
+  )
+
+  assert.equal(result.ok, true)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /violated tool_choice/, 'la razon elegida sigue siendo required_tool')
+  assert.match(hint, /did not reach the client/, 'el dato de la interceptacion no puede perderse')
+})
+
+// ── Salvage de aperturas ausentes en la ruta OpenAI (spec toolcall-salvage) ──
+// El mismo AGENT_LEAK que arriba dispara malformed_protocol (nombre NO declarado)
+// se vuelve la llamada real cuando el cliente SI declaro la herramienta: el parser
+// compartido lo rescata y el turno se acepta como tool_calls sin gastar retries.
+
+test('OpenAI loop: el leak con nombre declarado se rescata como tool_calls, cero retries', async () => {
+  let sent = 0
+  const result = await runAgentTurn(
+    [agentAnswerFrame(AGENT_LEAK)],
+    async () => { sent += 1; return { status: false } },
+    { allowed_tool_names: ['read_file', 'AskUserQuestion'] }
+  )
+
+  assert.equal(sent, 0, 'la llamada rescatada no debe gastar ningun retry')
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(result.attempt.toolCalls.length, 1)
+  assert.equal(result.attempt.toolCalls[0].function.name, 'AskUserQuestion')
+  const args = JSON.parse(result.attempt.toolCalls[0].function.arguments)
+  assert.equal(args.questions[0].header, 'Env', 'los arguments anidados se perdieron en el rescate')
+  assert.equal(result.attempt.visibleText.trim(), '', 'texto del payload sobrevivio como respuesta visible')
+})
+
+// ── Filtro clientToolNames sobre la evidencia de interceptacion (unidad) ──
+// Solo los nombres que el cliente declaro cuentan como drops interceptados; los
+// tools internos de la plataforma (web_search / web_extractor / sin nombre) se
+// dropean y loguean igual, pero no arman el retry 'intercepted'.
+
+test('normalizer: clientToolNames filtra que drops cuentan como interceptacion', () => {
+  const filtered = createUpstreamDeltaNormalizer({ clientToolNames: ['read_file'] })
+  filtered({ role: 'function', phase: 'answer', name: 'web_search', content: 'x' })
+  filtered({ role: 'function', phase: 'answer', content: 'no-name frame' })
+  assert.deepEqual(filtered.interceptedToolNames, [], 'un tool interno de plataforma conto como evidencia')
+  filtered({ role: 'function', phase: 'answer', name: 'read_file', content: 'Tool read_file does not exists' })
+  assert.deepEqual(filtered.interceptedToolNames, ['read_file'])
+
+  // Sin la opcion, el comportamiento historico se conserva: todo drop se registra.
+  const legacy = createUpstreamDeltaNormalizer()
+  legacy({ role: 'function', phase: 'answer', name: 'web_search', content: 'x' })
+  assert.deepEqual(legacy.interceptedToolNames, ['web_search'])
+
+  // Un set vacio equivale a no filtrar (peticiones sin tools no cambian de semantica).
+  const empty = createUpstreamDeltaNormalizer({ clientToolNames: [] })
+  empty({ role: 'function', phase: 'answer', name: 'web_search', content: 'x' })
+  assert.deepEqual(empty.interceptedToolNames, ['web_search'])
+
+  // P9: un frame SIN nombre jamas cuenta como evidencia con el filtro activo — ni
+  // siquiera si el cliente declaro un tool literalmente llamado "unknown". El
+  // placeholder de log no puede dejar que un frame anonimo se haga pasar por el.
+  const trap = createUpstreamDeltaNormalizer({ clientToolNames: ['unknown'] })
+  trap({ role: 'function', phase: 'answer', content: 'nameless platform frame' })
+  assert.deepEqual(trap.interceptedToolNames, [], 'un frame sin nombre conto como el tool "unknown"')
+  trap({ role: 'function', phase: 'answer', name: 'unknown', content: 'x' })
+  assert.deepEqual(trap.interceptedToolNames, ['unknown'], 'un tool declarado "unknown" con nombre real si cuenta')
+})
+
+// ── P10: el cableado clientToolNames de la ruta OpenAI, pinneado end-to-end ──
+// Revertir openai-agent-runtime a createUpstreamDeltaNormalizer() pelado debe
+// romper estas dos pruebas — antes nada las cubria.
+
+test('P10: drops de tools internos en la ruta OpenAI no disparan intercepted', async () => {
+  let sent = 0
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('web_search'), agentAnswerFrame(WRAPPED_NARRATION)],
+    async () => { sent += 1; return { status: false } }
+  )
+  assert.equal(sent, 0, 'un drop de web_search quemo un retry intercepted falso')
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'stop')
+  assert.match(result.attempt.visibleText, /unavailable/)
+})
+
+test('P10: los drops internos no queman el slot que malformed_protocol necesita', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentInterceptionFrame('web_search'), agentAnswerFrame(AGENT_LEAK)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(sent.length, 1)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /was NOT executed/, 'la razon debe ser malformed_protocol')
+  assert.doesNotMatch(hint, /did not reach the client/,
+    'web_search conto como interceptacion y robo la razon del retry')
 })

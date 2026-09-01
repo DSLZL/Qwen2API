@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 const config = require('../config')
 const DataPersistence = require('../utils/data-persistence')
-const { apiKeyVerify, adminKeyVerify } = require('../middlewares/authorization')
+const { adminKeyVerify } = require('../middlewares/authorization')
 const { logger } = require('../utils/logger')
 
 const dataPersistence = new DataPersistence()

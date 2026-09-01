@@ -1,7 +1,7 @@
 const axios = require('axios')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
+const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
 const { buildUserAgent } = require('./header-profile')
 
 /**

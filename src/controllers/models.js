@@ -37,7 +37,6 @@ const handleGetModels = async (req, res) => {
         const isImage = model?.info?.meta?.chat_type?.includes('t2i')
         const isVideo = model?.info?.meta?.chat_type?.includes('t2v')
         const isImageEdit = model?.info?.meta?.chat_type?.includes('image_edit')
-        const isDeepResearch = model?.info?.meta?.chat_type?.includes('deep_research')
 
         if (isThinking) {
             models.push(buildPublicModelData(model, '-thinking'))
@@ -63,9 +62,6 @@ const handleGetModels = async (req, res) => {
             models.push(buildPublicModelData(model, '-image-edit'))
         }
 
-        // if (isDeepResearch) {
-        //     models.push(buildPublicModelData(model, '-deep-research'))
-        // }
     }
     res.json({
         "object": "list",

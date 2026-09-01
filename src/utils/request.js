@@ -3,10 +3,11 @@ const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodForAccount } = require('./ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
-const { generateUUID, getTimezoneHeader, jitter } = require('./tools.js')
+const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
+const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
+const { TOOL_CALL_OPEN } = require('./agent-turn.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -114,8 +115,11 @@ const buildEssentialAgentHistory = (entries) => {
     const systemEntries = entries.filter(entry => ['system', 'developer'].includes(entry.role))
     const activeTask = [...entries].reverse().find(entry =>
         entry.role === 'user' &&
-        !/^\s*<tool_response\b/i.test(entry.content) &&
-        !/^\s*\[tool[_ ]result/i.test(entry.content)
+        // 和 foldToolMessages 的结果分隔符锁步：[TOOL RESULT: …] 是当前写法，
+        // <tool_response …> 是旧写法 —— 换分隔符时半路上的历史里两种都在，都要认。
+        !/^\s*\[tool[_ ]result\b/i.test(entry.content) &&
+        !/^\s*\[end tool result\]/i.test(entry.content) &&
+        !/^\s*<tool_response\b/i.test(entry.content)
     )
 
     const sections = []
@@ -263,7 +267,7 @@ const buildAgentContextLivePrompt = (
         `The complete system instructions, tool schemas, conversation history and current task are attached as ${attachmentName}.`,
         'Read that attachment as authoritative context before acting. The essential task state and recent tool progress are also retained inline below so the Agent loop must not reset if attachment parsing is delayed.',
         'Continue from the latest state; do not restart the task, stop after one intermediate action, or claim completion without tool-result verification.',
-        'When an available tool is needed, emit the real `<tool_call>` block immediately. Do not replace it with prose such as “I will run...” or “done”.'
+        `When an available tool is needed, emit the real \`${TOOL_CALL_OPEN}\` block immediately. Do not replace it with prose such as “I will run...” or “done”.`
     ].join('\n')
     return buildBudgetedAgentPrompt(original, maxBytes, notice, { attachmentAvailable: true })
 }

@@ -6,7 +6,7 @@ const dashboard = fs.readFileSync(require.resolve('../public/src/views/dashboard
 
 test('dashboard renders inactive CLI states as hover-only gray hint', () => {
   assert.match(dashboard, /v-if="isCliInactive\(token\.email\)"/);
-  assert.match(dashboard, /\:title="getCliTooltip\(token\.email\)"/);
+  assert.match(dashboard, /:title="getCliTooltip\(token\.email\)"/);
   assert.match(dashboard, /getCliInactiveLabel\(token\.email\)/);
   assert.match(dashboard, /text-gray-400/);
   assert.match(dashboard, /v-if="cliExpanded && getCliState\(token\.email\) === 'available'"/);

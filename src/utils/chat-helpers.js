@@ -1,5 +1,6 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
+const { normalizeAllowedToolNames } = require('./tool-prompt.js')
 const { uploadFileToQwenOss } = require('./upload.js')
 const { getLatestModels } = require('../models/models-map.js')
 const accountManager = require('./account.js')
@@ -510,12 +511,55 @@ const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
 /**
  * 创建上游 delta 归一化器：将 thinking_summary 的 extra.summary_thought 增量转为 phase=think 的 content
  * summary 帧为增长数组，只 emit 新增段落，避免重复。
+ *
+ * 返回的函数带一个 `.interceptedToolNames` 属性（string[]）：每丢弃一帧
+ * role:function 就记一个去重后的名字（上限 {@link INTERCEPTED_NAMES_CAP}，防止
+ * 多帧注入无限增长）。这是平台拦截原生工具调用的现场证据，Anthropic/OpenAI 的
+ * Agent 循环靠它决定 intercepted 重试。消费者只能**就地清空**
+ * （`arr.length = 0`），绝不能重新赋值 —— 非流式循环的按轮重置正依赖同一个
+ * 数组引用。
  * @returns {(delta: object) => ({ phase: string, content: string }|null)}
  */
-const createUpstreamDeltaNormalizer = () => {
+const INTERCEPTED_NAMES_CAP = 20
+const createUpstreamDeltaNormalizer = (options = {}) => {
+    // clientToolNames：客户端本次请求声明的工具名集合。传入后，只有**带真实名字**
+    // 且名字在集合里的 role:function 丢弃帧才计入 interceptedToolNames —— 平台自己
+    // 的内部工具（web_search / web_extractor）和无名帧会在纯散文回合上出现，把它们
+    // 当拦截证据会烧掉共享的协议恢复名额、触发假 intercepted 重试（实测 2026-08-31）。
+    // 无名帧永远不算证据：'unknown' 只是日志占位符，若客户端恰好声明了一个叫
+    // "unknown" 的工具，占位符不能替无名帧冒充它。不传则照旧全记：签名向后兼容。
+    // 日志不过滤 —— 每一次丢弃都要留痕。
+    // normalizeAllowedToolNames（tool-prompt.js）做同一件事；两处保持同一语义。
+    const clientToolNames = normalizeAllowedToolNames(options.clientToolNames)
     let summaryThoughtCount = 0
-    return (delta) => {
+    const normalize = (delta) => {
         if (!delta) return null
+
+        // Defect A: Drop Qwen's own tool-registry results (role="function").
+        // These are upstream injections, never the assistant's answer.
+        // Defect A protects OUR stream; the model's context still saw the platform's
+        // injection. The dropped names are the live evidence of that interception,
+        // so surface them for retry decisions instead of only logging.
+        if (delta.role === 'function') {
+            const droppedName = typeof delta.name === 'string' && delta.name.length > 0
+                ? delta.name
+                : null
+            const countsAsEvidence = clientToolNames
+                ? droppedName !== null && clientToolNames.has(droppedName)
+                : true
+            const interceptedName = droppedName || 'unknown'
+            if (countsAsEvidence &&
+                normalize.interceptedToolNames.length < INTERCEPTED_NAMES_CAP &&
+                !normalize.interceptedToolNames.includes(interceptedName)) {
+                normalize.interceptedToolNames.push(interceptedName)
+            }
+            logger.warn(
+                `Dropped upstream role:function delta with phase "${delta.phase}" and name "${interceptedName}"`,
+                'UPSTREAM_NORMALIZER'
+            )
+            return null
+        }
+
         const rawPhase = delta.phase
         const hasReasoningContent = typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0
         const hasContent = typeof delta.content === 'string' && delta.content.length > 0
@@ -546,6 +590,10 @@ const createUpstreamDeltaNormalizer = () => {
             content
         }
     }
+    // 附着在归一化函数上的拦截信号（见上方 JSDoc）。调用签名不变——
+    // 不读这个属性的消费者完全不受影响。
+    normalize.interceptedToolNames = []
+    return normalize
 }
 
 module.exports = {

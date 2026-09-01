@@ -1,6 +1,6 @@
 const crypto = require('crypto')
 const { logger } = require('./logger')
-const { getProxyAgent, getChatBaseUrl, applyProxyToFetchOptions } = require('./proxy-helper')
+const { getChatBaseUrl, applyProxyToFetchOptions } = require('./proxy-helper')
 
 /**
  * 为 PKCE 生成随机代码验证器
@@ -132,9 +132,9 @@ class CliAuthManager {
      * @returns {Promise<boolean>} 是否授权成功
      */
     async authorizeLogin(user_code, access_token, account) {
-        try {
-            const chatBaseUrl = getChatBaseUrl()
+        const chatBaseUrl = getChatBaseUrl()
 
+        try {
             const fetchOptions = {
                 method: 'POST',
                 headers: {

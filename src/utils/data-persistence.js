@@ -390,7 +390,7 @@ class DataPersistence {
     )
 
     let backupContent = null
-    let backupData = null
+    let backupData
     try {
       backupContent = await fs.readFile(this.backupFilePath, 'utf-8')
       backupData = JSON.parse(backupContent)

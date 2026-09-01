@@ -2,7 +2,8 @@ const { isJson } = require('./tools.js')
 const {
   parseToolCallsFromText,
   createToolCallStreamParser,
-  createNativeToolCallAccumulator
+  createNativeToolCallAccumulator,
+  containsOrphanProtocolResidue
 } = require('./tool-prompt.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
 const { createUpstreamDeltaNormalizer } = require('./chat-helpers.js')
@@ -49,7 +50,8 @@ const imageMarkdownFromDelta = (delta) => {
 const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   const hasTools = options.has_tools !== false
   const allowedToolNames = options.allowed_tool_names || []
-  const normalizeDelta = createUpstreamDeltaNormalizer()
+  // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）。
+  const normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames })
   const acceptUpstreamFrame = createUpstreamResponseFilter()
   const nativeTools = hasTools
     ? createNativeToolCallAccumulator({ allowedToolNames })
@@ -268,6 +270,9 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     streamedControlState: controlStreamParser?.getState?.() || null,
     toolCalls,
     toolErrors,
+    // 平台拦截的现场证据：Defect A 丢弃的 role:function 帧的名字（去重、有上限）。
+    // 门禁靠它识别"原生调用被平台吃掉、只剩叙述"的死亡回合。
+    interceptedToolNames: normalizeDelta.interceptedToolNames,
     webSearchInfo,
     totalTokens,
     upstreamFinishReason,
@@ -304,6 +309,21 @@ const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
   }
   if (requiresToolCall(options.tool_choice)) {
     return { accepted: false, finishReason: null, retryReason: 'required_tool' }
+  }
+  // 协议恢复防御（与 Anthropic 两个循环同族）。必须排在 final/blocked 接纳之前：
+  // 事故正是以 <agent_final> 包着的失败叙述被当成合法完结交付出去的。
+  // - intercepted：role:function 丢弃帧 = 平台吃掉了模型的原生调用，只剩叙述。
+  // - malformed_protocol：方括号协议写坏（孤儿闭标记 / 开头裸负载）整段泄漏为
+  //   可见正文。只是重试信号，泄漏的 JSON 永远不执行。
+  // intercepted 在前——丢弃帧是更强的证据。protocol_recovery_used 表示共享的
+  // 一次性恢复名额已用：跳过两个检查，让回合按原有规则交付（原样交付胜过死循环）。
+  if (options.has_tools !== false && !options.protocol_recovery_used) {
+    if ((attempt.interceptedToolNames?.length || 0) > 0) {
+      return { accepted: false, finishReason: null, retryReason: 'intercepted' }
+    }
+    if (containsOrphanProtocolResidue(attempt.visibleText)) {
+      return { accepted: false, finishReason: null, retryReason: 'malformed_protocol' }
+    }
   }
   if (attempt.controlKind === 'final' || attempt.controlKind === 'blocked') {
     if (attempt.visibleText.trim()) {
@@ -359,7 +379,9 @@ const exhaustedError = (attempt, retryReason) => {
     bare: '上游连续返回未声明完成状态的文本，已阻止 Agent 将未完成任务误判为结束',
     invalid_control: '上游连续返回无效的 Agent 完成标记',
     invalid_tool_call: '上游连续返回残缺、非法或不存在的工具调用',
-    required_tool: '上游连续违反 tool_choice，未返回要求的工具调用'
+    required_tool: '上游连续违反 tool_choice，未返回要求的工具调用',
+    intercepted: '上游的工具调用被平台拦截，重试后仍未恢复',
+    malformed_protocol: '上游持续返回残缺的工具调用协议，未能恢复为可执行调用'
   }
   return {
     status: 429,
@@ -384,6 +406,9 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   let upstreamContext = { ...(options.upstream_context || {}) }
   const retryBaseBody = options.upstream_request_body || options.requestBody
   let attemptsMade = 0
+  // 协议恢复重试（intercepted / malformed_protocol 共享）整个请求只允许一次。
+  // 用过之后 evaluate 会跳过这两个检查，让第二次拦截/残缺按原有规则原样交付。
+  let protocolRecoveryRetried = false
 
   const mergePresent = (base, extra) => {
     const merged = { ...base }
@@ -399,12 +424,28 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       ...options,
       attempt_number: attemptNumber
     })
-    const evaluation = evaluateOpenAIAgentAttempt(attempt, options)
+    const evaluation = evaluateOpenAIAgentAttempt(attempt, {
+      ...options,
+      protocol_recovery_used: protocolRecoveryRetried
+    })
     lastAttempt = attempt
     lastEvaluation = evaluation
     upstreamContext = mergePresent(upstreamContext, attempt.metadata)
 
     if (evaluation.accepted) {
+      // 恢复名额已用而本轮仍带拦截/残渣证据 = 第二次事故按原样交付。留一行日志，
+      // 生产环境要能区分"提示被采纳、回合恢复"和"第二次、原样交付"。
+      if (protocolRecoveryRetried && attempt.toolCalls.length === 0 &&
+          ((attempt.interceptedToolNames?.length || 0) > 0 ||
+            containsOrphanProtocolResidue(attempt.visibleText))) {
+        const giveUpDrops = (attempt.interceptedToolNames?.length || 0) > 0
+          ? ` (dropped: ${attempt.interceptedToolNames.join(', ')})`
+          : ''
+        logger.warn(
+          `Agent 协议恢复重试已用完，第二次拦截/残缺协议按原样交付${giveUpDrops}`,
+          'AGENT'
+        )
+      }
       // Solo ahora que la ronda quedó aceptada: si se hubiera emitido al vuelo, cada
       // intento rechazado habría dejado otra copia en el stream del cliente.
       if (attempt.recoveredReasoning && typeof options.on_reasoning_delta === 'function') {
@@ -424,8 +465,13 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       }
     }
 
+    // 有丢弃帧时任何拒绝理由都带上名字：invalid_tool_call/required_tool 优先级更高
+    // 时拦截会被盖住，这行日志是生产环境验证拦截确实发生的抓手。
+    const dropSuffix = (attempt.interceptedToolNames?.length || 0) > 0
+      ? `; dropped: ${attempt.interceptedToolNames.join(', ')}`
+      : ''
     logger.warn(
-      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason})`,
+      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason}${dropSuffix})`,
       'AGENT'
     )
     if (attempt.streamedVisibleText) {
@@ -442,10 +488,18 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     }
     if (attemptNumber >= maxAttempts || typeof requestSender !== 'function') break
 
-    const retryBody = appendRetryHint(
-      retryBaseBody,
-      buildAgentRetryHint(evaluation.retryReason)
-    )
+    if (evaluation.retryReason === 'intercepted' || evaluation.retryReason === 'malformed_protocol') {
+      protocolRecoveryRetried = true
+    }
+    let retryHint = buildAgentRetryHint(evaluation.retryReason)
+    // 别的理由（invalid_tool_call/required_tool）盖住拦截时，提示词仍要把关键
+    // 事实带上：调用没到客户端。不动优先级、不动名额。
+    if (evaluation.retryReason !== 'intercepted' &&
+        attempt.toolCalls.length === 0 &&
+        (attempt.interceptedToolNames?.length || 0) > 0) {
+      retryHint = `${retryHint}\n${buildAgentRetryHint('intercepted')}`
+    }
+    const retryBody = appendRetryHint(retryBaseBody, retryHint)
     const retryResponse = await requestSender(retryBody, {
       chatId: upstreamContext.chatId || null,
       parentId: upstreamContext.responseId || null,

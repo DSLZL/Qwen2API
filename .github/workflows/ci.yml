@@ -1,0 +1,36 @@
+name: ci
+
+# Gates the Node backend (tests + lint) on every push and PR, all branches,
+# no path filter (D40 — docker-build.yml's path filter is exactly the trap
+# this avoids). public/ (Vue/Vite) has no build or lint step here.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      # Lint first: it is the cheaper step, and a red test must not hide
+      # lint results.
+      - run: npm run lint
+      - run: npm test
+        env:
+          # src/config calls process.exit(1) at require time when API_KEY is
+          # unset, killing the five suites that load controllers. The value
+          # itself is never read by any test.
+          API_KEY: ci-test-key
