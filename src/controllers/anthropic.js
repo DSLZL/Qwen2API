@@ -354,10 +354,20 @@ const buildInternalRequest = async (anthropicReq) => {
 
   // 抢救的 schema 闸门数据源：工具名 → input_schema（normalizeAnthropicTools 已把它
   // 放进 function.parameters）。Object.create(null)：工具名来自请求方，绝不能让
-  // __proto__ 之类的名字碰原型链。
+  // __proto__ 之类的名字碰原型链。重名 fail closed（review loop 1，条目 12）：
+  // 同名声明两次的工具没有唯一 schema —— 有歧义就没有抢救，last-wins 会让先声明
+  // 的 schema 静默失效。
   const toolSchemas = Object.create(null);
+  const duplicatedToolNames = new Set();
   for (const tool of normalizedTools) {
-    if (tool.function?.name) toolSchemas[tool.function.name] = tool.function.parameters;
+    const name = tool.function?.name;
+    if (!name) continue;
+    if (duplicatedToolNames.has(name) || Object.prototype.hasOwnProperty.call(toolSchemas, name)) {
+      duplicatedToolNames.add(name);
+      delete toolSchemas[name];
+      continue;
+    }
+    toolSchemas[name] = tool.function.parameters;
   }
 
   return {
@@ -445,7 +455,9 @@ const describeToolErrors = (errors) => {
   )];
   const parts = [];
   if (unknown.length) parts.push(`unknown_tool: ${unknown.join(', ')}`);
-  for (const type of ['invalid_json', 'truncated_tool_call']) {
+  // salvage_rejected 单列：抢救闸门的拒绝正是 salvage-3 瞄准的类，诊断时
+  // 不能和真正的坏 JSON 混在一堆（review loop 1，条目 11）。
+  for (const type of ['invalid_json', 'truncated_tool_call', 'salvage_rejected']) {
     const count = errors.filter(e => e?.type === type).length;
     if (count) parts.push(`${type} ×${count}`);
   }
@@ -636,9 +648,22 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // malformed_protocol 与 think 晋升守卫的输入），不写任何字节到线上；tool_use
   // 照常放行。由构造只可能在最后一轮为真：名额一次性，任何再拒绝都直接 break。
   let suppressAttemptOutput = false;
-  // 跨轮累计的被定罪原文（每轮 flush 后从解析器收取）。交付层
-  // stripToolCallResidue 的唯一数据源 —— 绝无第二套独立扫描。
+  // 抑制重试开跑前，attempt 侧的抢救缓冲先按登记位置剥掉残渣、存进银行：抑制
+  // 只对**重试轮**的文本生效，attempt 侧原本要交付的 recovered 文本仍要交付
+  // （无闭标记 span 的尾巴可能是真实回答，不能整桶倒掉 —— review loop 1，条目 10）。
+  let bankedRecoveredText = '';
+  // 剥离是否真的发生过（交付时的日志留痕用）。
+  let recoveredResidueStripped = false;
+  // 跨轮累计的被定罪原文（每轮 flush 后从解析器收取；条目为 {text, at, channel}）。
+  // 空判据（hasToolProtocolError）跨轮消费 debris 类条目；recovered 通道的位置
+  // 剥离只用**当轮**解析器的登记（坐标系跟着 recoveredBuffer 走）。
   const residueSpans = [];
+  // 只剥 recovered 通道、并登记剥离是否发生。
+  const stripRecoveredResidue = (buffer, spans) => {
+    const out = stripToolCallResidue(buffer, spans, { channel: 'recovered' });
+    if (out !== buffer) recoveredResidueStripped = true;
+    return out;
+  };
   let agentTagStripper = null;
   let normalizeDelta = null;
   let acceptUpstreamFrame = null;
@@ -955,6 +980,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // 一直在做同一个晋升。守卫不满足但 think 里确实出现了调用（或其解析残骸）时，
     // 那是排放证据 —— 交给 thought_tool_call 重试。
     if (hasTools && !hasEmittedToolCalls) {
+      // 刻意不传 toolSchemas：think 通道里抢救永远不点火（晋升守卫逐字节保持
+      // 今天的行为；泄漏进 think 的坏调用照旧走 thought_tool_call 重试）。
       const thinkParsed = parseToolCallsFromText(attemptThinkText, { allowedToolNames });
       const promotable = allowedToolNames.length > 0 &&
         thinkParsed.toolCalls.length > 0 &&
@@ -1037,6 +1064,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       // 垃圾轮的文本根本不上线。
       if (retryReason === 'tool_error') {
         suppressAttemptOutput = true;
+        // attempt 侧的 recovered 文本进银行（剥掉登记残渣后），交付段仍会交付它。
+        bankedRecoveredText += stripRecoveredResidue(recoveredBuffer, parser ? parser.getResidueSpans() : []);
         logger.warn(
           `Anthropic Agent 已见正文后本轮 tool_error，消耗补偿名额做文本抑制重试 (${describeToolErrors(currentToolErrors())})`,
           'ANTHROPIC'
@@ -1070,17 +1099,40 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     currentUpstream = retryResp.response;
   }
 
+  // 循环已定案：抑制旗标只约束重试轮的流内发射；交付段（银行里的 attempt 侧
+  // 文本）不受它约束。
+  const suppressedFinalAttempt = suppressAttemptOutput;
+  suppressAttemptOutput = false;
+
+  // 空判据（hasToolProtocolError）用：visibleText 减去 **debris 类**残渣。debris
+  // 走 textDelta 通道且跨轮累计，位置在 agent-tag 剥离与跨轮拼接后不再可用 ——
+  // 但空判据是布尔题，按登记原文整段减去一次即可（同字节的副本删错不改变判空）。
+  // 两侧同一规范化：span 原文先过 stripAgentTags 再比对（visibleText 本身已剥过
+  // tag —— review loop 1，条目 6）。被闸门拒绝的合成负载从不进登记簿（它可能
+  // 就是回答本身），因此永远不会被这里判空成 502（条目 8）。
+  const subtractDebrisResidue = (text, spans) => {
+    let out = text;
+    for (const span of spans) {
+      if (!span || span.channel !== 'text' || typeof span.text !== 'string' || !span.text) continue;
+      const needle = stripAgentTags(span.text);
+      if (!needle) continue;
+      const at = out.indexOf(needle);
+      if (at !== -1) out = out.slice(0, at) + out.slice(at + needle.length);
+    }
+    return out;
+  };
+
   const finalToolErrors = currentToolErrors();
   // 有真正的正文时，工具错误不再升级成 502：客户端已经收到了一段回答，再补一个
   // error 事件只会让整条消息作废。判据是**正文**，不含抢救回来的原文 —— 一轮里除了
   // 一个残缺的 <tool_call> 什么都没有时，把裸 XML 当成回答交出去比明说失败更糟。
   //
   // salvage-3 的两处收紧：
-  // - 空判据看**剥离残渣后的**正文 —— 纯残渣回合不算"已有回答"，照旧 502；
+  // - 空判据看**剥掉 debris 后的**正文 —— 纯残渣回合不算"已有回答"，照旧 502；
   //   绝不交付一条内容只有协议残渣的消息。
   // - required 未兑现但真实正文已经流出去时，按 end_turn 收尾 + warn，而不是 502：
   //   半条已交付的消息 + error 事件比一个没兑现的 required 更糟。
-  const strippedVisibleText = stripToolCallResidue(visibleText, residueSpans);
+  const strippedVisibleText = subtractDebrisResidue(visibleText, residueSpans);
   const hasToolProtocolError = !!(
     !hasEmittedToolCalls &&
     !strippedVisibleText.trim() &&
@@ -1094,16 +1146,22 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     );
   }
 
-  // 交付层剥残渣（layer 3）：recoveredBuffer 是被定罪的原文，剥掉登记过的 span 后
-  // 剩什么交付什么。剥离只发生在这里 —— 检测输入（attemptVisibleText / cleanedText）
-  // 从未被碰过。文本抑制的重试轮什么文本都不交付（只有它的 tool_use 已经上线）。
-  if (!hasToolProtocolError && recoveredBuffer && !suppressAttemptOutput) {
-    const residueFree = stripAgentTags(stripToolCallResidue(recoveredBuffer, residueSpans));
+  // 交付层剥残渣（layer 3）：recovered 文本剥掉**当轮登记**的 span（位置坐标系
+  // 跟着 recoveredBuffer 走）后，剩什么交付什么 —— 无闭标记 span 的尾巴可能是
+  // 真实回答。银行里躺着抑制重试之前 attempt 侧已剥好的文本；抑制的重试轮自己
+  // 的 recovered 文本不交付（只有它的 tool_use 已经上线）。先剥残渣再剥 agent
+  // tag（与 C 同序 —— 登记的是解析器原始字节）。剥离只发生在这里 —— 检测输入
+  // （attemptVisibleText / cleanedText）从未被碰过。
+  const finalRecoveredText = suppressedFinalAttempt
+    ? bankedRecoveredText
+    : bankedRecoveredText + stripRecoveredResidue(recoveredBuffer, parser ? parser.getResidueSpans() : []);
+  if (!hasToolProtocolError && finalRecoveredText) {
+    const residueFree = stripAgentTags(finalRecoveredText);
     if (residueFree.trim()) emitTextDelta(residueFree, { countsAsVisible: false });
-    if (residueFree !== stripAgentTags(recoveredBuffer)) {
-      // Ask-first 决议：静默剥离，只在日志留痕，不注入任何替代文本。
-      logger.warn('Anthropic Agent 交付前剥离协议残渣（recoveredBuffer），零协议字节上线', 'ANTHROPIC');
-    }
+  }
+  if (!hasToolProtocolError && recoveredResidueStripped) {
+    // Ask-first 决议：静默剥离，只在日志留痕，不注入任何替代文本。
+    logger.warn('Anthropic Agent 交付前按登记位置剥离协议残渣（recoveredBuffer），零协议字节上线', 'ANTHROPIC');
   }
   if (!hasToolProtocolError && finalToolErrors.length > 0) {
     // logger 上只有 warn，没有 warning —— 旧的 logger.warning?.() 是静默空操作。
@@ -1288,9 +1346,12 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     ...parsedTools.errors,
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
-  // 跨轮累计的被定罪原文（narrationFallback 可能交付更早轮次的 cleanedText，
-  // 所以不能只留最后一轮的）。交付层 stripToolCallResidue 的唯一数据源。
-  const residueSpans = [...(parsedTools.residueSpans || [])];
+  // 本轮 parser 的**原始** cleanedText 与登记 span（位置坐标系 = 原始文本）。
+  // 检测（decideRetryReason / settleThinkPhase）继续吃 tag-stripped 的
+  // cleanedText，逐字节不变；剥残渣只在交付点、在原始文本上按位置进行，然后
+  // 才剥 agent tag（与 B 同序 —— review loop 1，条目 6）。
+  let roundRawCleanedText = parsedTools.cleanedText;
+  let roundResidueSpans = parsedTools.residueSpans || [];
 
   // 非流式没有"已经写到线上"的问题：什么都还没发出去，所以每一轮都可以重试。
   const terminalFinish = () =>
@@ -1305,6 +1366,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const settleThinkPhase = () => {
     attemptThinkEvidence = false;
     if (!hasTools || toolCalls.length > 0) return;
+    // 刻意不传 toolSchemas：think 通道里抢救永远不点火（与 B 同一条纪律）。
     const thinkParsed = parseToolCallsFromText(attemptThinkingContent, { allowedToolNames });
     const promotable = allowedToolNames.length > 0 &&
       thinkParsed.toolCalls.length > 0 &&
@@ -1366,8 +1428,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let protocolRecoveryRetried = false;
   // finding 2：拦截重试会用重试轮的解析结果整体替换 cleanedText。若重试轮空手
   // 而归，绝不能拿 502 换掉已经拿到的叙述 —— 留底，收尾时兜底交付（同流式分支
-  // "迟到的叙述胜过死掉的会话"的精神）。
-  let narrationFallback = '';
+  // "迟到的叙述胜过死掉的会话"的精神）。留底形态：{ stripped, raw, spans }。
+  let narrationFallback = null;
 
   while (attemptsMade < maxAttempts) {
     const retryReason = decideRetryReason();
@@ -1430,7 +1492,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 刻意不在此列：它的 cleanedText 就是泄漏的协议残渣本身（负载 + 孤儿闭标记），
     // 兜底交付它等于把这套防御要挡的裸协议原样递给客户端。
     if ((retryReason === 'intercepted' || retryReason === 'thought_tool_call') && cleanedText.trim()) {
-      narrationFallback = cleanedText;
+      // 叙述连同它那一轮的原始文本与登记 span 一起留底：兜底交付时残渣剥离要用
+      // 同一坐标系（review loop 1，条目 9 —— 兜底轮零错误也可能携带残渣）。
+      narrationFallback = { stripped: cleanedText, raw: roundRawCleanedText, spans: roundResidueSpans };
     }
 
     let retryResp;
@@ -1472,7 +1536,10 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       .map((call, index) => ({ ...call, index }));
     cleanedText = stripAgentTags(parsedRetry.cleanedText);
     toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
-    residueSpans.push(...(parsedRetry.residueSpans || []));
+    // 交付轮换人：原始文本与登记 span 一起换（丢了这行，上一轮的 span 配不上
+    // 本轮文本，残渣原样上线 —— 有测试钉住）。
+    roundRawCleanedText = parsedRetry.cleanedText;
+    roundResidueSpans = parsedRetry.residueSpans || [];
     // 重试轮的 think phase 同样要定案：晋升或留证据，下一次 decideRetryReason 才看得见。
     settleThinkPhase();
   }
@@ -1499,8 +1566,11 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
 
   // finding 2：拦截重试之后的轮次两手空空时，交还拦截那一轮的叙述，而不是 502。
   // 客户端拿到"工具好像坏了"的叙述还能继续对话；拿到 502 这回合就死了。
+  // 原始文本与登记 span 跟着叙述一起换 —— 交付剥离用同一坐标系。
   if (toolCalls.length === 0 && !cleanedText.trim() && narrationFallback) {
-    cleanedText = narrationFallback;
+    cleanedText = narrationFallback.stripped;
+    roundRawCleanedText = narrationFallback.raw;
+    roundResidueSpans = narrationFallback.spans;
   }
 
   if (hasTools && toolCalls.length === 0 && (toolErrors.length > 0 || requiresToolCall(toolChoice))) {
@@ -1545,15 +1615,17 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     });
   }
 
-  // salvage-3 layer 3：工具错误残留到最后时，交付文本剥掉登记过的残渣 span ——
-  // 检测与重试判定（decideRetryReason / containsOrphanProtocolResidue）早已在
-  // 未剥离文本上跑完，剥离只发生在交付点。Ask-first 决议：静默剥离、日志留痕，
-  // 不注入任何替代文本。零错误的回合逐字节保持今天的交付。
-  if (hasTools && toolErrors.length > 0) {
-    const residueFree = stripToolCallResidue(cleanedText, residueSpans);
+  // salvage-3 layer 3：交付轮登记过残渣才动交付文本（review loop 1，条目 9：
+  // 门挂在 residueSpans 上，不挂 toolErrors —— narrationFallback 轮零错误也可能
+  // 携带残渣）。位置驱动：在**原始**文本上按登记落点剥，再剥 agent tag（与 B
+  // 同序）。检测与重试判定（decideRetryReason / containsOrphanProtocolResidue）
+  // 早已在未剥离文本上跑完 —— 剥离只发生在交付点。Ask-first 决议：静默剥离、
+  // 日志留痕，不注入任何替代文本。零残渣轮逐字节保持今天的交付。
+  if (hasTools && roundResidueSpans.length > 0) {
+    const residueFree = stripAgentTags(stripToolCallResidue(roundRawCleanedText, roundResidueSpans));
     if (residueFree !== cleanedText) {
       cleanedText = residueFree;
-      logger.warn('Anthropic 非流式交付前剥离协议残渣，零协议字节交付', 'ANTHROPIC');
+      logger.warn('Anthropic 非流式交付前按登记位置剥离协议残渣，零协议字节交付', 'ANTHROPIC');
     }
   }
 
