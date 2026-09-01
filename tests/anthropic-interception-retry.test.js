@@ -1055,8 +1055,11 @@ describe('promoted thinking is contained in loop C (R10)', () => {
 });
 
 describe('give-up and degraded-delivery paths actually log (R11)', () => {
-  it('stream: tool_error after streamed prose → break warn + degraded-delivery warn, no retry', async () => {
-    const sender = scriptedSender(turnOf(answerFrame('should never be consumed')));
+  // salvage-3 cambio este contrato: tool_error tras prosa ya no rompe en seco —
+  // consume el MISMO cupo retriedAfterVisibleText con un retry de texto suprimido
+  // (solo tool_use del retry llega al cliente; su texto jamas pisa el wire).
+  it('stream: tool_error after streamed prose → one text-suppressed retry, retry text never on the wire', async () => {
+    const sender = scriptedSender(turnOf(answerFrame('retry narration that must stay off the wire')));
     let res;
     const warns = await captureWarns(async () => {
       res = await runStream(
@@ -1065,15 +1068,13 @@ describe('give-up and degraded-delivery paths actually log (R11)', () => {
       );
     });
 
-    assert.equal(sender.calls.length, 0, 'tool_error after prose must not retry');
+    assert.equal(sender.calls.length, 1, 'tool_error after prose consumes the single compensation slot');
     assert.ok(
-      warns.some(l => /已见正文后本轮出现 tool_error/.test(l)),
-      `expected the tool_error-after-prose break warn, got:\n${warns.join('\n')}`
+      warns.some(l => /已见正文后本轮 tool_error，消耗补偿名额做文本抑制重试/.test(l)),
+      `expected the text-suppressed-retry warn, got:\n${warns.join('\n')}`
     );
-    assert.ok(
-      warns.some(l => /工具协议出错但已产出内容/.test(l)),
-      `expected the degraded-delivery warn, got:\n${warns.join('\n')}`
-    );
+    assert.doesNotMatch(res.output, /retry narration that must stay off the wire/);
+    assert.match(res.output, /Working on it\./);
     assert.match(res.output, /"type":"message_stop"/);
     assert.doesNotMatch(res.output, /"type":"error"/);
   });

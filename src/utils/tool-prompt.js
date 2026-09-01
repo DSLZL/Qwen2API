@@ -490,6 +490,227 @@ const escapeRawControlCharsInStrings = (jsonText) => {
 };
 
 /**
+ * 引号修复：把负载里**没加引号的键**和**丢了开引号的字符串值**补上引号。
+ *
+ * 实测（2026-08-31 16:39，事故 3）：模型写出 `{command:find … 2>/dev/null", "description": …}`
+ * —— 键没有引号，值丢了开引号但**留着闭引号**。引号奇偶被打破后 extractBalancedObject
+ * 永远配不平，整段按 truncated_tool_call 死掉，残渣泄漏给客户端。
+ *
+ * 修复是确定性的、绝不重塑内容：
+ * - 键位置的裸标识符加引号（`command:` → `"command":`）。
+ * - 值位置的裸内容开一个引号，**复用文本里已有的下一个 `"` 作闭引号**；没有现成
+ *   闭引号时字符串不闭合，严格解析当场拒绝 —— 绝不猜测值在哪里结束。
+ * - 裸区间内的反斜杠与 C0 控制字符按 JSON 规则转义：字节必须原样往返，
+ *   `C:\foo` 绝不能解析成带换页符的另一条命令。
+ * - `true`/`false`/`null` 仅在后面**紧跟分隔符**（空白 / `,` / `}` / `]`）时算字面量，
+ *   否则按裸字符串起点处理（`find …` 以 f 开头，绝不能吞成 false）。
+ * - 数字按完整 token 放行（`1.5` 不能在小数点处被劈成两截）。
+ *
+ * 与 escapeRawControlCharsInStrings 同一套 in-string 状态机纪律，不新增第四种扫描
+ * 风格。修复产物必须再过严格 JSON.parse + 白名单 + schema 三道闸门（见
+ * buildToolCallPayload / salvageTruncatedSpan），任何一道不过就回到今天的错误路径。
+ * 没有任何可修复点时返回 null（合法 JSON 是不动点）。
+ * @param {string} jsonText - 严格解析失败的 JSON 文本
+ * @returns {string|null}
+ */
+const repairLooseToolPayload = (jsonText) => {
+  const text = String(jsonText);
+  let out = '';
+  let repaired = false;
+  let inString = false;
+  let escaped = false;
+  let inLoose = false;
+  const stack = [];
+  let expectKey = false;
+
+  const literalLengthAt = (i) => {
+    const match = text.slice(i, i + 6).match(/^(true|false|null)/);
+    if (!match) return 0;
+    const next = text[i + match[1].length];
+    return (next === ',' || next === '}' || next === ']' ||
+        next === ' ' || next === '\t' || next === '\r' || next === '\n')
+      ? match[1].length
+      : 0;
+  };
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      out += char;
+      continue;
+    }
+    if (inLoose) {
+      // 裸值提升成字符串：复用下一个现成的 '"' 作闭引号；区间内按 JSON 规则转义。
+      if (char === '"') {
+        inLoose = false;
+        out += char;
+        continue;
+      }
+      if (char === '\\') {
+        out += '\\\\';
+        continue;
+      }
+      const code = char.charCodeAt(0);
+      if (code <= 0x1f) {
+        if (char === '\n') out += '\\n';
+        else if (char === '\r') out += '\\r';
+        else if (char === '\t') out += '\\t';
+        else out += `\\u${code.toString(16).padStart(4, '0')}`;
+        continue;
+      }
+      out += char;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      out += char;
+      continue;
+    }
+    if (char === '{') {
+      stack.push('{');
+      expectKey = true;
+      out += char;
+      continue;
+    }
+    if (char === '[') {
+      stack.push('[');
+      expectKey = false;
+      out += char;
+      continue;
+    }
+    if (char === '}' || char === ']') {
+      stack.pop();
+      expectKey = false;
+      out += char;
+      continue;
+    }
+    if (char === ',') {
+      expectKey = stack[stack.length - 1] === '{';
+      out += char;
+      continue;
+    }
+    if (char === ':') {
+      expectKey = false;
+      out += char;
+      continue;
+    }
+    if (char === ' ' || char === '\t' || char === '\r' || char === '\n') {
+      out += char;
+      continue;
+    }
+    if (expectKey) {
+      const ident = text.slice(i).match(/^[A-Za-z_$][\w$-]*/);
+      if (ident) {
+        out += `"${ident[0]}"`;
+        i += ident[0].length - 1;
+        expectKey = false;
+        repaired = true;
+        continue;
+      }
+      // 不是标识符：原样放行，让严格解析拒绝。
+      out += char;
+      continue;
+    }
+    if (char === '-' || (char >= '0' && char <= '9')) {
+      const num = text.slice(i).match(/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/);
+      if (num) {
+        out += num[0];
+        i += num[0].length - 1;
+        continue;
+      }
+    }
+    const literalLen = literalLengthAt(i);
+    if (literalLen > 0) {
+      out += text.slice(i, i + literalLen);
+      i += literalLen - 1;
+      continue;
+    }
+    // 值位置的裸内容：开引号进入 loose 态，当前字符重走一遍（进上面的转义逻辑）。
+    out += '"';
+    inLoose = true;
+    repaired = true;
+    i -= 1;
+  }
+  return repaired ? out : null;
+};
+
+/**
+ * 触发器尾巴上的名字提示。事故 3 的形态：`[TOOL_CALL]Bash{…}` —— 触发器正则吃掉
+ * `[TOOL_CALL`，尾巴是 `]Bash`，真正的工具名骑在触发器和负载之间。
+ *
+ * 「名字只能来自负载」的铁律（见 buildToolCallPayload 头注释）在这里有一个**受闸门
+ * 保护的例外**：尾巴名字只作为 hint 携带，只有在（1）负载缺 name 信封、（2）hint 在
+ * 非空白名单里、（3）修复后 arguments 的每个顶层键都在该工具声明的
+ * input_schema.properties 里，三条全部成立时才被采用（见 gateSalvagedPayload）。
+ * 不可信内容抄回来的 `<tool_call bash>` 过不了这三连闸门；判不满足就回到今天的
+ * 错误路径，绝不执行。只认方括号触发器（尖括号形态不携带 `]`）；尾巴除名字外只许空白。
+ * @param {string} triggerText - 触发器原文
+ * @param {string} tail - 触发器结尾到负载 '{' 之间的文本
+ * @returns {string|null}
+ */
+const NAME_HINT_TAIL_RE = /^\][ \t]*([A-Za-z_][\w-]{0,63})[ \t\r\n]*$/;
+const extractTriggerNameHint = (triggerText, tail) => {
+  if (!triggerText || triggerText.charAt(0) !== '[') return null;
+  const match = String(tail || '').match(NAME_HINT_TAIL_RE);
+  return match ? match[1] : null;
+};
+
+/**
+ * 抢救的 schema 闸门：修复后 arguments 的每个顶层键都必须出现在该工具声明的
+ * input_schema.properties 里。误修复把一个值劈成幻影键时，幻影键不在 schema 里 ——
+ * 拒绝；schema 缺席（调用方没传、工具没声明 properties、arguments 不是普通对象）
+ * 一律拒绝（fail closed）。确定性抢救绝不执行被重塑过的命令：这道闸门就是那句
+ * 承诺的机制。toolSchemas 是普通对象（anthropic.js 用 Object.create(null) 构造，
+ * 工具名来自请求方，不能让 __proto__ 之类的名字碰原型链）。
+ */
+const argumentsMatchToolSchema = (name, args, toolSchemas) => {
+  if (!toolSchemas || typeof toolSchemas !== 'object') return false;
+  if (!Object.prototype.hasOwnProperty.call(toolSchemas, name)) return false;
+  const properties = toolSchemas[name]?.properties;
+  if (!properties || typeof properties !== 'object') return false;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
+  return Object.keys(args).every(key => Object.prototype.hasOwnProperty.call(properties, key));
+};
+
+/** 抢救三连闸门：非空白名单 + 名字在白名单 + schema 键全命中。任何一道不过 → 不抢救。 */
+const gateSalvagedPayload = (payload, salvage) =>
+  !!(salvage && salvage.allowedToolNames && salvage.allowedToolNames.has(payload.name) &&
+    argumentsMatchToolSchema(payload.name, payload.arguments, salvage.toolSchemas));
+
+/**
+ * 交付层的残渣剥离。spans 是解析器登记的**被定罪原文**（结果上的 residueSpans /
+ * 流式的 getResidueSpans()）—— 本函数只做减法，绝不自己搜索标记：第二套独立扫描
+ * 会和解析器对「什么算残渣」产生分歧，围栏里的文档由构造保证从不进 spans。
+ * 只在交付点调用：检测输入（cleanedText、attemptVisibleText、think 晋升守卫）
+ * 必须保持逐字节原样。每条 span 只移除一次命中（同一残渣出现两次会登记两条）；
+ * 整段命中不了时退回 trim 后再试一次 —— cleanedText 收尾的 trim() 会削掉贴边
+ * span 的首尾空白。没传 spans 时原样返回。
+ * @param {string} text - 即将交付的文本
+ * @param {Array<string>} [spans] - 解析器登记的残渣原文
+ * @returns {string}
+ */
+const stripToolCallResidue = (text, spans) => {
+  let out = String(text || '');
+  if (!Array.isArray(spans) || spans.length === 0) return out;
+  for (const span of spans) {
+    if (typeof span !== 'string' || !span) continue;
+    let target = span;
+    let at = out.indexOf(target);
+    if (at === -1) {
+      target = span.trim();
+      if (!target) continue;
+      at = out.indexOf(target);
+    }
+    if (at === -1) continue;
+    out = out.slice(0, at) + out.slice(at + target.length);
+  }
+  return out;
+};
+
+/**
  * 把窗口里取到的 JSON 变成 { name, arguments }。
  *
  * 工具名**只能**来自负载的 name 键。曾经允许从触发器尾巴上取名字（`<tool_call read_file>`），
@@ -502,14 +723,19 @@ const escapeRawControlCharsInStrings = (jsonText) => {
  * 判成错误 —— 而 chat.js:868 会把它升级成一个硬 invalid_tool_call。
  * @returns {{ payload: Object }|{ error: Object }}
  */
-const buildToolCallPayload = (jsonText) => {
+const buildToolCallPayload = (jsonText, salvage = null) => {
   let parsed;
+  let quoteRepaired = false;
   try {
     parsed = JSON.parse(jsonText);
   } catch (error) {
-    // 修复只在严格解析失败之后运行，且仅限字符串内的裸控制字符（见
-    // escapeRawControlCharsInStrings）。修复日志只登记类型，绝不带负载内容 ——
-    // Node 24 的 e.message 会把负载片段嵌进去，负载可能携带凭据。
+    // 修复链（都只在严格解析失败之后运行，合法负载构造上不可能被改动）：
+    //   1) 字符串内裸控制字符转义（见 escapeRawControlCharsInStrings）；
+    //   2) 引号修复（见 repairLooseToolPayload）—— 仅在调用方带抢救上下文
+    //      （salvage：非空白名单 + toolSchemas）时运行，产物必须再过严格解析
+    //      与下方的抢救闸门。
+    // 修复日志只登记类型，绝不带负载内容 —— Node 24 的 e.message 会把负载
+    // 片段嵌进去，负载可能携带凭据。
     const repairedText = escapeRawControlCharsInStrings(jsonText);
     if (repairedText !== null) {
       try {
@@ -521,6 +747,17 @@ const buildToolCallPayload = (jsonText) => {
         warnTool('tool_call 负载修复：严格解析失败后转义字符串内的裸控制字符，重新解析成功');
       }
     }
+    if (parsed === undefined && salvage) {
+      const looseText = repairLooseToolPayload(repairedText ?? jsonText);
+      if (looseText !== null) {
+        try {
+          parsed = JSON.parse(looseText);
+          quoteRepaired = true;
+        } catch (_) {
+          parsed = undefined;
+        }
+      }
+    }
     if (parsed === undefined) {
       return { error: { type: 'invalid_json', raw: jsonText, reason: error?.message } };
     }
@@ -530,10 +767,61 @@ const buildToolCallPayload = (jsonText) => {
   }
   const name = firstNonEmptyString(parsed.name, parsed.tool, parsed.function);
   if (!name) {
+    // 无信封负载 + 触发器尾巴名字：受三连闸门保护的例外（见 extractTriggerNameHint）。
+    // 整个已解析对象就是 arguments。闸门不满足 → 今天的错误路径，绝不执行。
+    if (salvage?.nameHint) {
+      const candidate = { name: salvage.nameHint, arguments: parsed };
+      if (gateSalvagedPayload(candidate, salvage)) {
+        warnTool(`tool_call 负载抢救：无信封负载采用触发器尾巴名字，白名单 + schema 闸门放行${quoteRepaired ? '（含引号修复）' : ''}`);
+        return { payload: candidate };
+      }
+    }
     return { error: { type: 'invalid_json', raw: jsonText, reason: 'no tool name' } };
   }
-  const args = parsed.arguments ?? parsed.parameters ?? parsed.args ?? {};
-  return { payload: { name, arguments: args } };
+  const payload = { name, arguments: parsed.arguments ?? parsed.parameters ?? parsed.args ?? {} };
+  // 引号修复的产物（以及 forceGate 的抢救调用方，见 salvageTruncatedSpan）必须
+  // 整体过抢救闸门：修复把一个值劈成幻影键时 schema 闸门拒绝，回到今天的错误路径。
+  if (quoteRepaired || salvage?.forceGate) {
+    if (!gateSalvagedPayload(payload, salvage)) {
+      return { error: { type: 'invalid_json', raw: jsonText, reason: 'salvage gate rejected' } };
+    }
+    if (quoteRepaired) {
+      warnTool('tool_call 负载抢救：引号修复后严格解析成功，白名单 + schema 闸门放行');
+    }
+  }
+  return { payload };
+};
+
+/**
+ * truncated_tool_call 定罪点的最后一搏：负载配不平（引号奇偶被打破）的整段，
+ * 在按错误落账**之前**跑一次完整抢救。
+ *
+ * 步骤：先用方括号闭标记扫描把区间截到 `[END TOOL CALL]` 之前（配平已死，
+ * 闭标记是这段里唯一还可信的定界证据；没有闭标记就取到文本末尾）；对区间跑
+ * 引号修复；修复文本上重新配平取对象；对象再走 buildToolCallPayload 全链
+ * （严格解析 → 控制字符转义 → 信封 / nameHint，forceGate 让信封形态也过
+ * 白名单 + schema 抢救闸门）。任何一步失手 → 返回 null，调用方照今天定罪。
+ * 成功时整段（含闭标记、含对象之后的协议碎屑，如事故 3 的多余 `}`）都被消费
+ * —— 它按构造是协议残渣，不是回答。每段只跑一次、O(span)。
+ * @param {string} spanText - 从负载 '{' 起的原文
+ * @param {Object} salvage - { allowedToolNames, toolSchemas, nameHint }
+ * @returns {{ payload: Object, end: number }|null} end = spanText 里闭标记之后的下标
+ */
+const salvageTruncatedSpan = (spanText, salvage) => {
+  if (!salvage) return null;
+  const closerMatch = spanText.match(TOOL_CALL_CLOSE_BRACKET_SCAN_RE);
+  const region = closerMatch ? spanText.slice(0, closerMatch.index) : spanText;
+  const repairedRegion = repairLooseToolPayload(region);
+  if (repairedRegion === null) return null;
+  const object = extractBalancedObject(repairedRegion, 0);
+  if (!object) return null;
+  const built = buildToolCallPayload(object.text, { ...salvage, forceGate: true });
+  if (built.error) return null;
+  warnTool(`truncated_tool_call 抢救成功：引号修复后负载配平并通过全部闸门（span ${spanText.length} 字符）`);
+  return {
+    payload: built.payload,
+    end: closerMatch ? closerMatch.index + closerMatch[0].length : spanText.length
+  };
 };
 
 /** allowedToolNames 闸门。两条路径共用同一个，任何一侧都不会漏掉。 */
@@ -882,16 +1170,27 @@ const parseToolCallsFromText = (fullText, options = {}) => {
   // 无非空白名单就无抢救：名字闸门在旧语义下放行一切，抢救会给未声明的名字
   // 捏出 tool_use。正则触发器保持旧行为。
   const salvage = !!allowedToolNames;
+  // 引号修复 / 尾巴名字抢救的上下文：非空白名单**且** toolSchemas 齐备才存在
+  // （fail closed —— schema 闸门是抢救的一半边界）。只有 anthropic 路径传
+  // toolSchemas；chat.js / openai 路径不传，行为不变。
+  const repairSalvage = allowedToolNames && options.toolSchemas
+    ? { allowedToolNames, toolSchemas: options.toolSchemas }
+    : null;
   // 快路径必须与识别器同步：正则触发器**或**（抢救开启时）答案开头的裸负载形状，
   // 二者都算“可能有调用”。只测正则的话，合成开端在这里就被拦掉了。
   if (typeof fullText !== 'string' ||
       !(TOOL_CALL_TRIGGER_RE.test(fullText) || (salvage && isLeakedToolPayloadShape(fullText)))) {
-    return { cleanedText: fullText || '', toolCalls: [], errors: [], warnings: [] };
+    return { cleanedText: fullText || '', toolCalls: [], errors: [], warnings: [], residueSpans: [] };
   }
 
   const toolCalls = [];
   const errors = [];
   const warnings = [];
+  // 被定罪原文的登记簿：交付层的 stripToolCallResidue 只认这里的 span，绝不自己
+  // 搜索。只登记**确实落进 cleanedText** 的残渣；被整段吞掉的（not the first
+  // content）没有可剥离的字节，不登记；围栏里的文档在触发器阶段就被按正文压制，
+  // 由构造永远不进这里。
+  const residueSpans = [];
   const code = createCodeContextTracker();
 
   let cleanedText = '';
@@ -942,6 +1241,7 @@ const parseToolCallsFromText = (fullText, options = {}) => {
       logSyntheticRejected('unbalanced payload');
       const next = fullText.slice(from).match(TOOL_CALL_TRIGGER_RE);
       const cut = next ? from + next.index : fullText.length;
+      residueSpans.push(fullText.slice(from, cut));
       releaseDebris(fullText.slice(from, cut));
       return cut;
     }
@@ -950,16 +1250,18 @@ const parseToolCallsFromText = (fullText, options = {}) => {
       // 闭标记缺席或邻接违规：负载按可见文本放行，尾巴交还扫描循环。
       warnings.push({ type: 'synthetic_rejected', reason: 'missing closer', raw: '' });
       logSyntheticRejected('missing closer');
+      residueSpans.push(object.text);
       releaseRejectedSpan(object.text);
       return object.end;
     }
-    const built = buildToolCallPayload(object.text);
+    const built = buildToolCallPayload(object.text, repairSalvage);
     const gateError = built.error || gateToolName(built.payload, allowedToolNames);
     if (gateError) {
       // 只登记错误**类型**：invalid_json 的 reason 是 JSON.parse 的 e.message，
       // 现代 V8 会把负载片段嵌进去 —— 负载可能带凭据，绝不进日志或 warnings。
       warnings.push({ type: 'synthetic_rejected', reason: gateError.type, raw: '' });
       logSyntheticRejected(gateError.type);
+      residueSpans.push(fullText.slice(from, closer.end));
       releaseRejectedSpan(fullText.slice(from, closer.end));
       return closer.end;
     }
@@ -1014,17 +1316,32 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     }
 
     const object = extractBalancedObject(fullText, payloadAt);
+    const tail = fullText.slice(afterTrigger, payloadAt);
+    const nameHint = repairSalvage ? extractTriggerNameHint(trigger, tail) : null;
     if (!object) {
+      // 定罪之前的最后一搏（事故 3：引号奇偶被打破，负载永远配不平）。抢救成功时
+      // 整段（触发器→闭标记）都被消费，不落错误、不占重试名额。
+      const salvaged = repairSalvage
+        ? salvageTruncatedSpan(fullText.slice(payloadAt), { ...repairSalvage, nameHint })
+        : null;
+      if (salvaged) {
+        toolCalls.push(createToolCallObject(salvaged.payload, toolCalls.length));
+        position = consumeDuplicateClosers(fullText, payloadAt + salvaged.end, false).end;
+        continue;
+      }
       // 一个配不平的 '{' 不能吞掉它后面的一切：只登记这一段的错误，扫描继续。
       const error = { type: 'truncated_tool_call', raw: fullText.slice(afterTrigger) };
       errors.push(error);
       logToolError(error);
+      // 登记将要落进 cleanedText 的确切原文：触发器 + 到下一个触发器（或文末）为止
+      // 的尾巴 —— 触发器在下面按正文放行，尾巴由后续扫描按正文放行，两段连续。
+      const next = fullText.slice(afterTrigger).match(TOOL_CALL_TRIGGER_RE);
+      residueSpans.push(fullText.slice(triggerAt, next ? afterTrigger + next.index : fullText.length));
       releaseProse(trigger);
       position = afterTrigger;
       continue;
     }
 
-    const tail = fullText.slice(afterTrigger, payloadAt);
     const afterFence = skipTrailingFence(fullText, object.end, tail, false).end;
     const closer = consumeTrailingCloser(fullText, afterFence, false);
     const spanEnd = Math.max(afterFence, closer.end);
@@ -1045,11 +1362,12 @@ const parseToolCallsFromText = (fullText, options = {}) => {
       continue;
     }
 
-    const built = buildToolCallPayload(object.text);
+    const built = buildToolCallPayload(object.text, repairSalvage ? { ...repairSalvage, nameHint } : null);
     const error = built.error || gateToolName(built.payload, allowedToolNames);
     if (error) {
       errors.push(error);
       logToolError(error);
+      residueSpans.push(span);
       releaseDebris(span);
       position = spanEnd;
       continue;
@@ -1065,7 +1383,7 @@ const parseToolCallsFromText = (fullText, options = {}) => {
   }
 
   releaseProse(fullText.slice(position));
-  return { cleanedText: cleanedText.trim(), toolCalls, errors, warnings };
+  return { cleanedText: cleanedText.trim(), toolCalls, errors, warnings, residueSpans };
 };
 
 /**
@@ -1084,8 +1402,16 @@ const createToolCallStreamParser = (options = {}) => {
   const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
   // 与整段路径同一条规则：无非空白名单就无抢救（名字闸门在旧语义下放行一切）。
   const salvage = !!allowedToolNames;
+  // 引号修复 / 尾巴名字抢救的上下文 —— 与整段路径同一条规则：白名单 + toolSchemas
+  // 齐备才存在（fail closed）。
+  const repairSalvage = allowedToolNames && options.toolSchemas
+    ? { allowedToolNames, toolSchemas: options.toolSchemas }
+    : null;
   const errors = [];
   const warnings = [];
+  // 被定罪原文的登记簿（与整段路径的 residueSpans 同义）：recoveredText 与
+  // debris/rejected 释放的确切字节。交付层的 stripToolCallResidue 只认这里。
+  const residueSpans = [];
   const code = createCodeContextTracker();
   let pendingText = '';
   let triggerText = '';
@@ -1172,6 +1498,7 @@ const createToolCallStreamParser = (options = {}) => {
         logSyntheticRejected('unbalanced payload');
         const next = afterTrigger.match(TOOL_CALL_TRIGGER_RE);
         if (next) {
+          residueSpans.push(afterTrigger.slice(0, next.index));
           releaseDebris(result, afterTrigger.slice(0, next.index));
           return finish(afterTrigger.slice(next.index));
         }
@@ -1179,9 +1506,11 @@ const createToolCallStreamParser = (options = {}) => {
           // 超过缓冲上界但流还活着：留住尾部一个触发器长度（可能正断在半个触发器
           // 上），其余按残片放行。每轮至少剥掉 cap - TRIGGER_MAX 字符，不会死循环。
           const keep = Math.min(TOOL_CALL_TRIGGER_MAX, afterTrigger.length);
+          residueSpans.push(afterTrigger.slice(0, afterTrigger.length - keep));
           releaseDebris(result, afterTrigger.slice(0, afterTrigger.length - keep));
           return finish(afterTrigger.slice(afterTrigger.length - keep));
         }
+        residueSpans.push(afterTrigger);
         releaseDebris(result, afterTrigger);
         return finish('');
       }
@@ -1194,15 +1523,17 @@ const createToolCallStreamParser = (options = {}) => {
       if (!closer.found) {
         warnings.push({ type: 'synthetic_rejected', reason: 'missing closer', raw: '' });
         logSyntheticRejected('missing closer');
+        residueSpans.push(object.text);
         releaseRejectedSpan(result, object.text);
         return finish(afterTrigger.slice(object.end));
       }
-      const built = buildToolCallPayload(object.text);
+      const built = buildToolCallPayload(object.text, repairSalvage);
       const gateError = built.error || gateToolName(built.payload, allowedToolNames);
       if (gateError) {
         // 只登记错误类型，不登记 reason：invalid_json 的 reason 内嵌负载片段（见整段路径）。
         warnings.push({ type: 'synthetic_rejected', reason: gateError.type, raw: '' });
         logSyntheticRejected(gateError.type);
+        residueSpans.push(afterTrigger.slice(0, closer.end));
         releaseRejectedSpan(result, afterTrigger.slice(0, closer.end));
         return finish(afterTrigger.slice(closer.end));
       }
@@ -1233,6 +1564,20 @@ const createToolCallStreamParser = (options = {}) => {
     if (!object) {
       // 缓冲区有上界：一个永远配不平的 '{' 不能把整条流吃进内存。
       if (!flushing && afterTrigger.length <= TOOL_CALL_SPAN_MAX) return null;
+      // 定罪之前的最后一搏（事故 3 的流式路径：flush 时引号奇偶仍是破的）。
+      // 每段只到这里一次（finish 清掉 inToolCall），O(span)。
+      const salvaged = repairSalvage
+        ? salvageTruncatedSpan(afterTrigger.slice(payloadAt), {
+          ...repairSalvage,
+          nameHint: extractTriggerNameHint(triggerText, afterTrigger.slice(0, payloadAt))
+        })
+        : null;
+      if (salvaged) {
+        result.completedCalls.push(createToolCallObject(salvaged.payload, emittedCallCount));
+        emittedCallCount += 1;
+        closerSwallow = true;
+        return finish(afterTrigger.slice(payloadAt + salvaged.end));
+      }
       const error = {
         type: 'truncated_tool_call',
         raw: afterTrigger,
@@ -1240,6 +1585,7 @@ const createToolCallStreamParser = (options = {}) => {
       };
       errors.push(error);
       logToolError(error);
+      residueSpans.push(triggerText + afterTrigger);
       result.recoveredText += triggerText + afterTrigger;
       return finish('');
     }
@@ -1270,12 +1616,15 @@ const createToolCallStreamParser = (options = {}) => {
       return finish(leftover);
     }
 
-    const built = buildToolCallPayload(object.text);
+    const built = buildToolCallPayload(object.text, repairSalvage
+      ? { ...repairSalvage, nameHint: extractTriggerNameHint(triggerText, tail) }
+      : null);
     const error = built.error || gateToolName(built.payload, allowedToolNames);
     if (error) {
       errors.push(error);
       logToolError(error);
       // 失败片段不喂给代码上下文追踪器，也不算“正文已经开始” —— 与整段路径同一条规则。
+      residueSpans.push(span);
       result.recoveredText += span;
       return finish(leftover);
     }
@@ -1414,7 +1763,9 @@ const createToolCallStreamParser = (options = {}) => {
     // 触发但无负载：单独一条通道，刻意不参与 hasParseError()。合成开端的拒绝
     // （synthetic_rejected）不算在内 —— 那些回合根本没有触发器，语义不能被翻转。
     hasTriggeredWithoutCall: () => warnings.some(w => w.type === 'triggered_unrecovered'),
-    getWarnings: () => [...warnings]
+    getWarnings: () => [...warnings],
+    // 被定罪原文的登记簿：交付层剥残渣的唯一数据源（见 stripToolCallResidue）。
+    getResidueSpans: () => [...residueSpans]
   };
 };
 
@@ -1514,5 +1865,9 @@ module.exports = {
   normalizeAllowedToolNames,
   serializeToolArguments,
   // 控制字符修复导出仅供测试钉住"合法 JSON 是不动点"的不变式。
-  escapeRawControlCharsInStrings
+  escapeRawControlCharsInStrings,
+  // 交付层残渣剥离：文本减去解析器登记的被定罪 span（绝无第二套独立扫描）。
+  stripToolCallResidue,
+  // 引号修复导出仅供测试钉住确定性与"合法 JSON 是不动点"的不变式。
+  repairLooseToolPayload
 };
