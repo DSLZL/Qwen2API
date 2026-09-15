@@ -1,5 +1,5 @@
 const { isJson, generateUUID } = require('../utils/tools.js');
-const { createUsageObject } = require('../utils/precise-tokenizer.js');
+const { createUsageObject, mergeUpstreamUsage, resolveUsage, describeUsageSource } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest, invalidateContextPrefix } = require('../utils/request.js');
 const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js');
 const accountManager = require('../utils/account.js');
@@ -1252,8 +1252,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       usage: {
         input_tokens: 0,
         output_tokens: 0,
-        cache_creation_input_tokens: null,
-        cache_read_input_tokens: null
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0
       }
     }
   });
@@ -1264,6 +1264,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let thinkingSignature = null;
   let promptTokens = 0;
   let completionTokens = 0;
+  let upstreamUsage = null; // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
   let upstreamFinishReason = null;
   let upstreamCompleted;
   let upstreamEventCount;
@@ -1532,10 +1533,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   const onUpstreamDelta = async (json) => {
     // 丢弃其余候选回答的帧：上游多路并发会让内容重复
     if (!acceptUpstreamFrame(json)) return;
-    if (json.usage) {
-      promptTokens = json.usage.prompt_tokens || promptTokens;
-      completionTokens = json.usage.completion_tokens || completionTokens;
-    }
+    // Qwen 的 usage 用 DashScope 命名（input_tokens/output_tokens），每个 typing 帧带累计值
+    upstreamUsage = mergeUpstreamUsage(upstreamUsage, json.usage);
     if (!json.choices || json.choices.length === 0) return;
     const choice = json.choices[0];
     const reportedFinishReason = choice.finish_reason ?? choice.delta?.finish_reason;
@@ -1998,10 +1997,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     return;
   }
 
-  if (promptTokens === 0 && completionTokens === 0) {
-    const usage = createUsageObject(requestBody?.messages || '', completionContent, null);
-    promptTokens = usage.prompt_tokens || 0;
-    completionTokens = usage.completion_tokens || 0;
+  // 只对上游没报的字段补本地估算（早停的回合收不到尾部 usage 帧）
+  {
+    const usage = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || '', completionContent, null));
+    promptTokens = usage.prompt_tokens;
+    completionTokens = usage.completion_tokens;
+    logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${promptTokens} output=${completionTokens}`, 'ANTHROPIC');
   }
 
   // Daily stats 累计——一次性归属主账户（见模块顶部 attributeChatUsage 注释）
@@ -2013,8 +2014,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     usage: {
       input_tokens: promptTokens,
       output_tokens: completionTokens,
-      cache_creation_input_tokens: null,
-      cache_read_input_tokens: null
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
     }
   });
   writeAnthropicEvent(res, 'message_stop', { type: 'message_stop' });
@@ -2043,6 +2044,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let answerContent = '';
   let promptTokens = 0;
   let completionTokens = 0;
+  let upstreamUsage = null; // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
   let webSearchInfo = null;
   let upstreamFinishReason = null;
   let upstreamCompleted;
@@ -2126,10 +2128,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const onUpstreamDelta = async (json) => {
     // 丢弃其余候选回答的帧：上游多路并发会让内容重复
     if (!acceptUpstreamFrame(json)) return;
-    if (json.usage) {
-      promptTokens = json.usage.prompt_tokens || promptTokens;
-      completionTokens = json.usage.completion_tokens || completionTokens;
-    }
+    // Qwen 的 usage 用 DashScope 命名（input_tokens/output_tokens），每个 typing 帧带累计值
+    upstreamUsage = mergeUpstreamUsage(upstreamUsage, json.usage);
     if (!json.choices || json.choices.length === 0) return;
     const choice = json.choices[0];
     const reportedFinishReason = choice.finish_reason ?? choice.delta?.finish_reason;
@@ -2570,12 +2570,16 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     });
   }
 
-  if (promptTokens === 0 && completionTokens === 0) {
-    // 早停的回合收不到上游尾部的 usage 帧：原生调用的参数 JSON 也进本地估算，免得 ~0。
-    const nativeArgsText = nativeToolCalls.map(call => call.function.arguments || '').join('');
-    const usage = createUsageObject(requestBody?.messages || '', thinkingContent + answerContent + nativeArgsText, null);
-    promptTokens = usage.prompt_tokens || 0;
-    completionTokens = usage.completion_tokens || 0;
+  // 只对上游没报的字段补本地估算。早停的回合收不到上游尾部的 usage 帧：
+  // 原生调用的参数 JSON 也进本地估算，免得 ~0。
+  {
+    const usage = resolveUsage(upstreamUsage, () => {
+      const nativeArgsText = nativeToolCalls.map(call => call.function.arguments || '').join('');
+      return createUsageObject(requestBody?.messages || '', thinkingContent + answerContent + nativeArgsText, null);
+    });
+    promptTokens = usage.prompt_tokens;
+    completionTokens = usage.completion_tokens;
+    logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${promptTokens} output=${completionTokens}`, 'ANTHROPIC');
   }
 
   const contentBlocks = [];
@@ -2618,8 +2622,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     usage: {
       input_tokens: promptTokens,
       output_tokens: completionTokens,
-      cache_creation_input_tokens: null,
-      cache_read_input_tokens: null
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
     }
   });
 };

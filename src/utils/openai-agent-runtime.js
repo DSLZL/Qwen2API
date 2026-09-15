@@ -7,6 +7,7 @@ const {
   ANSWER_PHASES
 } = require('./tool-prompt.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
+const { mergeUpstreamUsage } = require('./precise-tokenizer.js')
 const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('./chat-helpers.js')
 const { assertNoUpstreamFailure, UpstreamResponseError, isRateLimitError, isWafChallengeError } = require('./upstream-error.js')
 const { recordFailedAccount, createAccountReplayBody } = require('./agent-account-failover.js')
@@ -324,11 +325,7 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   let lastCreated = null
   const emittedImages = new Set()
   const pendingImages = []
-  let totalTokens = {
-    prompt_tokens: 0,
-    completion_tokens: 0,
-    total_tokens: 0
-  }
+  let upstreamUsage = null // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
 
   const streamResult = await consumeSSEStream(upstreamResponse, async (frame) => {
     if (!frame.data || frame.data.trim() === '[DONE]') return
@@ -352,13 +349,8 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     if (!acceptUpstreamFrame(decoded)) return
     if (decoded.response_id) acceptedResponseId = decoded.response_id
 
-    if (decoded.usage) {
-      totalTokens = {
-        prompt_tokens: decoded.usage.prompt_tokens || totalTokens.prompt_tokens,
-        completion_tokens: decoded.usage.completion_tokens || totalTokens.completion_tokens,
-        total_tokens: decoded.usage.total_tokens || totalTokens.total_tokens
-      }
-    }
+    // Qwen 的 usage 用 DashScope 命名（input_tokens/output_tokens），每个 typing 帧带累计值
+    upstreamUsage = mergeUpstreamUsage(upstreamUsage, decoded.usage)
     if (!Array.isArray(decoded.choices) || decoded.choices.length === 0) return
 
     const choice = decoded.choices[0]
@@ -584,7 +576,8 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     // 门禁靠它识别"原生调用被平台吃掉、只剩叙述"的死亡回合。
     interceptedToolNames: normalizeDelta.interceptedToolNames,
     webSearchInfo,
-    totalTokens,
+    // 上游逐帧累计的 usage（null = 没报）；chat.js 的 normalizeAgentUsage 只补没报的字段
+    upstreamUsage,
     upstreamFinishReason,
     upstreamCompleted: streamResult.completed,
     upstreamEventCount: streamResult.eventCount,

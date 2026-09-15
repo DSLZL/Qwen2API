@@ -1,5 +1,5 @@
 const { isJson, generateUUID } = require('../utils/tools.js')
-const { createUsageObject } = require('../utils/precise-tokenizer.js')
+const { createUsageObject, mergeUpstreamUsage, resolveUsage, describeUsageSource } = require('../utils/precise-tokenizer.js')
 const { sendChatRequest } = require('../utils/request.js')
 const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js')
 const {
@@ -280,13 +280,11 @@ const runWithSSEHeartbeat = async (res, work, intervalMs = 15000) => {
 }
 
 const normalizeAgentUsage = (attempt, requestBody, completionText) => {
-    let usage = { ...(attempt?.totalTokens || {}) }
-    if (!usage.prompt_tokens && !usage.completion_tokens) {
-        usage = createUsageObject(requestBody?.messages || [], completionText, null)
-    }
-    usage.prompt_tokens = Math.max(0, Number(usage.prompt_tokens) || 0)
-    usage.completion_tokens = Math.max(0, Number(usage.completion_tokens) || 0)
-    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
+    // attempt.upstreamUsage：runtime 逐帧累计的上游 usage（DashScope 命名已归一化；null = 没报）。
+    // 只对上游没报的字段补本地估算。
+    const upstreamUsage = attempt?.upstreamUsage ?? null
+    const usage = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || [], completionText, null))
+    logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${usage.prompt_tokens} output=${usage.completion_tokens}`, 'CHAT')
     return usage
 }
 
@@ -662,6 +660,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             completion_tokens: 0,
             total_tokens: 0
         }
+        let upstreamUsage = null // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
         let completionContent = '' // 收集完整的回复内容用于token估算
         let visibleContent = ''
 
@@ -810,13 +809,8 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             // 丢弃其余候选回答的帧：上游多路并发会让内容重复
             if (!acceptUpstreamFrame(decodeJson)) return
 
-            if (decodeJson.usage) {
-                totalTokens = {
-                    prompt_tokens: decodeJson.usage.prompt_tokens || totalTokens.prompt_tokens,
-                    completion_tokens: decodeJson.usage.completion_tokens || totalTokens.completion_tokens,
-                    total_tokens: decodeJson.usage.total_tokens || totalTokens.total_tokens
-                }
-            }
+            // Qwen 的 usage 用 DashScope 命名（input_tokens/output_tokens），每个 typing 帧带累计值
+            upstreamUsage = mergeUpstreamUsage(upstreamUsage, decodeJson.usage)
 
             if (!decodeJson.choices || decodeJson.choices.length === 0) return
 
@@ -1055,13 +1049,9 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             writeContentDelta(`\n\n---\n${webSearchTable}`)
         }
 
-        // 计算最终的token使用量
-        if (totalTokens.prompt_tokens === 0 && totalTokens.completion_tokens === 0) {
-            totalTokens = createUsageObject(requestBody?.messages || promptText, completionContent, null)
-            logger.info(`流式使用tiktoken计算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
-        } else {
-            logger.info(`流式使用上游真实Token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
-        }
+        // 计算最终的token使用量：只对上游没报的字段补本地估算
+        totalTokens = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || promptText, completionContent, null))
+        logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${totalTokens.prompt_tokens} output=${totalTokens.completion_tokens}`, 'CHAT')
 
         totalTokens.prompt_tokens = Math.max(0, totalTokens.prompt_tokens || 0)
         totalTokens.completion_tokens = Math.max(0, totalTokens.completion_tokens || 0)
@@ -1181,6 +1171,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             completion_tokens: 0,
             total_tokens: 0
         }
+        let upstreamUsage = null // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
 
         // 提取prompt文本用于token估算
         let promptText = ''
@@ -1207,13 +1198,8 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             // 丢弃其余候选回答的帧：上游多路并发会让内容重复
             if (!acceptUpstreamFrame(decodeJson)) return
 
-            if (decodeJson.usage) {
-                totalTokens = {
-                    prompt_tokens: decodeJson.usage.prompt_tokens || totalTokens.prompt_tokens,
-                    completion_tokens: decodeJson.usage.completion_tokens || totalTokens.completion_tokens,
-                    total_tokens: decodeJson.usage.total_tokens || totalTokens.total_tokens
-                }
-            }
+            // Qwen 的 usage 用 DashScope 命名（input_tokens/output_tokens），每个 typing 帧带累计值
+            upstreamUsage = mergeUpstreamUsage(upstreamUsage, decodeJson.usage)
             if (!decodeJson.choices || decodeJson.choices.length === 0) return
 
             const choice = decodeJson.choices[0]
@@ -1424,13 +1410,10 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             assistantContent += `\n\n---\n${webSearchTable}`
         }
 
-        // 计算最终的token使用量（推理内容计入 completion，与 DeepSeek 一致；旧版 fullReasoning 为空）
-        if (totalTokens.prompt_tokens === 0 && totalTokens.completion_tokens === 0) {
-            totalTokens = createUsageObject(requestBody?.messages || promptText, fullReasoning + fullContent, null)
-            logger.info(`非流式使用tiktoken计算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
-        } else {
-            logger.info(`非流式使用上游真实Token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
-        }
+        // 计算最终的token使用量：只对上游没报的字段补本地估算
+        //（推理内容计入 completion，与 DeepSeek 一致；旧版 fullReasoning 为空）
+        totalTokens = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || promptText, fullReasoning + fullContent, null))
+        logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${totalTokens.prompt_tokens} output=${totalTokens.completion_tokens}`, 'CHAT')
 
         totalTokens.prompt_tokens = Math.max(0, totalTokens.prompt_tokens || 0)
         totalTokens.completion_tokens = Math.max(0, totalTokens.completion_tokens || 0)
