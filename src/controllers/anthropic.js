@@ -1,5 +1,5 @@
 const { isJson, generateUUID } = require('../utils/tools.js');
-const { createUsageObject, mergeUpstreamUsage, resolveUsage, describeUsageSource } = require('../utils/precise-tokenizer.js');
+const { createUsageObject, mergeUpstreamUsage, reportUsage } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest, invalidateContextPrefix } = require('../utils/request.js');
 const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js');
 const accountManager = require('../utils/account.js');
@@ -1347,6 +1347,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // 但本控制器没有 Agent 回合门禁去解包，标签会原样发给客户端。剥掉它们。
     agentTagStripper = createAgentTagStripper();
     recoveredBuffer = '';
+    // usage 也按轮全新：报的是最后一轮上游给的，没给就估算，绝不继承上一轮的。
+    upstreamUsage = null;
     attemptVisibleText = '';
     attemptThinkText = '';
     attemptThinkEvidence = false;
@@ -1998,12 +2000,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   }
 
   // 只对上游没报的字段补本地估算（早停的回合收不到尾部 usage 帧）
-  {
-    const usage = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || '', completionContent, null));
-    promptTokens = usage.prompt_tokens;
-    completionTokens = usage.completion_tokens;
-    logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${promptTokens} output=${completionTokens}`, 'ANTHROPIC');
-  }
+  const usage = reportUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || '', completionContent), 'ANTHROPIC');
+  promptTokens = usage.prompt_tokens;
+  completionTokens = usage.completion_tokens;
 
   // Daily stats 累计——一次性归属主账户（见模块顶部 attributeChatUsage 注释）
   attributeChatUsage(ctx.currentAccount, promptTokens, completionTokens);
@@ -2446,6 +2445,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 判定输入按轮清零（thinkingContent 本身继续累计 —— 响应交付语义不动）。
     attemptThinkingContent = '';
     upstreamFinishReason = null;
+    // usage 也按轮全新：报的是最后一轮上游给的，没给就估算，绝不继承上一轮的。
+    upstreamUsage = null;
     const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta, { shouldStop: () => stopRequested });
     upstreamCompleted = retryResult.completed;
     if (!upstreamCompleted && !upstreamFinishReason) {
@@ -2572,15 +2573,12 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
 
   // 只对上游没报的字段补本地估算。早停的回合收不到上游尾部的 usage 帧：
   // 原生调用的参数 JSON 也进本地估算，免得 ~0。
-  {
-    const usage = resolveUsage(upstreamUsage, () => {
-      const nativeArgsText = nativeToolCalls.map(call => call.function.arguments || '').join('');
-      return createUsageObject(requestBody?.messages || '', thinkingContent + answerContent + nativeArgsText, null);
-    });
-    promptTokens = usage.prompt_tokens;
-    completionTokens = usage.completion_tokens;
-    logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${promptTokens} output=${completionTokens}`, 'ANTHROPIC');
-  }
+  const usage = reportUsage(upstreamUsage, () => {
+    const nativeArgsText = nativeToolCalls.map(call => call.function.arguments || '').join('');
+    return createUsageObject(requestBody?.messages || '', thinkingContent + answerContent + nativeArgsText);
+  }, 'ANTHROPIC');
+  promptTokens = usage.prompt_tokens;
+  completionTokens = usage.completion_tokens;
 
   const contentBlocks = [];
   if (thinkingContent && thinkingContent.trim()) {

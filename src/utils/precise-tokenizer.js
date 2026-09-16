@@ -4,6 +4,7 @@
  */
 
 const tiktoken = require('tiktoken')
+const { logger } = require('./logger.js')
 
 /**
  * 使用tiktoken进行精准token计数
@@ -68,23 +69,13 @@ function countMessagesTokens(messages, model = 'gpt-3.5-turbo') {
 }
 
 /**
- * 创建精准的usage对象
+ * 本地估算的 usage 对象（只在上游没报时用，见 reportUsage）
  * @param {Array|string} promptMessages - 提示消息或文本
  * @param {string} completionText - 完成文本
- * @param {object} realUsage - 真实的usage数据（如果有）
  * @param {string} model - 模型名称
  * @returns {object} usage对象
  */
-function createUsageObject(promptMessages, completionText = '', realUsage = null, model = 'gpt-3.5-turbo') {
-  // 如果有真实的usage数据，优先使用
-  if (realUsage && realUsage.prompt_tokens && realUsage.completion_tokens) {
-    return {
-      prompt_tokens: realUsage.prompt_tokens,
-      completion_tokens: realUsage.completion_tokens,
-      total_tokens: realUsage.total_tokens || (realUsage.prompt_tokens + realUsage.completion_tokens)
-    }
-  }
-
+function createUsageObject(promptMessages, completionText = '', model = 'gpt-3.5-turbo') {
   // 计算prompt tokens
   let promptTokens = 0
   if (Array.isArray(promptMessages)) {
@@ -104,11 +95,10 @@ function createUsageObject(promptMessages, completionText = '', realUsage = null
 }
 
 /**
- * 把上游帧里的一个计数字段转成有效数字：数字串也接受；负数、NaN、非数字、
+ * 把上游帧里的一个计数字段转成有效数字：负数、NaN、非数字、
  * 以及 0（上游"没数"时也发 0）都当作"没报"→ null。
  */
 function toReportedCount(value) {
-  if (typeof value === 'string' && value.trim() !== '') value = Number(value)
   return (typeof value === 'number' && Number.isFinite(value) && value > 0) ? value : null
 }
 
@@ -166,14 +156,18 @@ function resolveUsage(acc, estimate) {
 }
 
 /**
- * 给日志用：这次响应的 usage 来源。两项都来自上游是 "upstream"；
+ * resolveUsage + 每个响应一行日志。来源：两项都来自上游是 "upstream"；
  * 哪怕只有一项是本地估算的也算 "estimated"。
- * @param {{prompt_tokens: number|null, completion_tokens: number|null}|null} acc
- * @returns {'upstream'|'estimated'}
+ * @param {{prompt_tokens: number|null, completion_tokens: number|null}|null} acc - 累积的上游 usage
+ * @param {() => {prompt_tokens: number, completion_tokens: number}} estimate - 惰性本地估算
+ * @param {string} tag - 日志模块标签（'ANTHROPIC' / 'CHAT'）
+ * @returns {{prompt_tokens: number, completion_tokens: number, total_tokens: number}}
  */
-function describeUsageSource(acc) {
-  const complete = (acc?.prompt_tokens ?? null) !== null && (acc?.completion_tokens ?? null) !== null
-  return complete ? 'upstream' : 'estimated'
+function reportUsage(acc, estimate, tag) {
+  let source = 'upstream'
+  const usage = resolveUsage(acc, () => { source = 'estimated'; return estimate() })
+  logger.info(`usage source=${source} input=${usage.prompt_tokens} output=${usage.completion_tokens}`, tag)
+  return usage
 }
 
 module.exports = {
@@ -183,5 +177,5 @@ module.exports = {
   normalizeUpstreamUsage,
   mergeUpstreamUsage,
   resolveUsage,
-  describeUsageSource
+  reportUsage
 }

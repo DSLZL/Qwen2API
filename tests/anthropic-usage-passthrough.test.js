@@ -75,7 +75,8 @@ const eventsOf = (output) => output
   .filter(Boolean)
   .map(line => JSON.parse(line.slice(6)));
 
-const runStream = async (frames) => {
+/** `secondAttemptFrames`: lo que devuelve el sendRequest del segundo attempt; null = un solo attempt. */
+const runStream = async (frames, secondAttemptFrames = null) => {
   const res = createMockStreamResponse();
   await handleAnthropicStream(res, {
     message_id: 'msg_usage',
@@ -85,7 +86,7 @@ const runStream = async (frames) => {
     allowedToolNames: [],
     toolSchemas: {},
     requestBody: { messages: [{ role: 'user', content: 'hi' }] },
-    sendRequest: async () => ({ status: false })
+    sendRequest: async () => (secondAttemptFrames ? { status: true, response: upstream(secondAttemptFrames) } : { status: false })
   }, upstream(frames));
   return eventsOf(res.output);
 };
@@ -130,8 +131,26 @@ describe('reported usage comes from upstream usage (Anthropic /v1/messages)', ()
     assert.ok(usage.output_tokens > 0, `output_tokens=${usage.output_tokens}`);
   });
 
-  const runNonStream = async (frames) => {
-    upstreamFactory = () => upstream(frames);
+  it('stream: several attempts → the last attempt\'s usage; a later attempt that reports nothing does NOT inherit the first attempt\'s counters', async () => {
+    // Attempt 1: sin texto visible → el gate reintenta ('empty'); traia 651/9 del upstream.
+    // Attempt 2: texto valido y SOLO output_tokens. Reportado: output 5 (attempt 2) e input
+    // estimado —— nunca los 651 del attempt 1.
+    const usage = deltaUsage(await runStream(
+      [frame('', { input_tokens: 651, output_tokens: 9, total_tokens: 660 }), STOP],
+      [frame('Hello there', { output_tokens: 5 }), STOP]
+    ));
+    assert.equal(usage.output_tokens, 5);
+    assert.ok(usage.input_tokens > 0 && usage.input_tokens !== 651, `input_tokens=${usage.input_tokens}`);
+  });
+
+  /** Cada argumento es un attempt: el primero es el upstream inicial, los demas, attempts posteriores. */
+  const runNonStream = async (...attempts) => {
+    const queue = [...attempts];
+    upstreamFactory = () => {
+      const frames = queue.shift();
+      assert.ok(frames, 'upstream pedido mas veces que attempts preparados');
+      return upstream(frames);
+    };
     try {
       const res = createMockJsonResponse();
       await handleAnthropicMessages({
@@ -160,5 +179,14 @@ describe('reported usage comes from upstream usage (Anthropic /v1/messages)', ()
     const usage = await runNonStream([frame('Hello there'), STOP]);
     assert.ok(usage.input_tokens > 0, `input_tokens=${usage.input_tokens}`);
     assert.ok(usage.output_tokens > 0, `output_tokens=${usage.output_tokens}`);
+  });
+
+  it('non-stream: several attempts → the last attempt\'s usage; a later attempt that reports nothing does NOT inherit the first attempt\'s counters', async () => {
+    const usage = await runNonStream(
+      [frame('', { input_tokens: 651, output_tokens: 9, total_tokens: 660 }), STOP],
+      [frame('Hello there', { output_tokens: 5 }), STOP]
+    );
+    assert.equal(usage.output_tokens, 5);
+    assert.ok(usage.input_tokens > 0 && usage.input_tokens !== 651, `input_tokens=${usage.input_tokens}`);
   });
 });

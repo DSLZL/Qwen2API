@@ -164,10 +164,10 @@ describe('reported usage comes from upstream usage (/v1/chat/completions)', () =
     // con OTROS números. Lo reportado debe ser lo del attempt aceptado (700/5), no 651/9 ni 1351/14.
     const first = [frame('<agent_final></agent_final>', { input_tokens: 651, output_tokens: 9, total_tokens: 660 }), STOP];
     const second = [frame('<agent_final>Hello</agent_final>', { input_tokens: 700, output_tokens: 5, total_tokens: 705 }), STOP];
-    let retries = 0;
-    const sendChatRequest = async () => { retries += 1; return { status: true, response: upstreamOf(second) }; };
+    let extraAttempts = 0;
+    const sendChatRequest = async () => { extraAttempts += 1; return { status: true, response: upstreamOf(second) }; };
     const usage = await runNonStream(first, { ...agentOptions(), agent_turn_max_attempts: 2, sendChatRequest });
-    assert.equal(retries, 1, 'hubo exactamente un reintento');
+    assert.equal(extraAttempts, 1, 'hubo exactamente un segundo attempt');
     assert.equal(usage.prompt_tokens, 700);
     assert.equal(usage.completion_tokens, 5);
     assert.equal(usage.total_tokens, 705);

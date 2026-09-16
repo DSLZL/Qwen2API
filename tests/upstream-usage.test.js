@@ -10,7 +10,7 @@ const {
   normalizeUpstreamUsage,
   mergeUpstreamUsage,
   resolveUsage,
-  describeUsageSource
+  reportUsage
 } = require('../src/utils/precise-tokenizer.js');
 
 describe('normalizeUpstreamUsage', () => {
@@ -33,10 +33,6 @@ describe('normalizeUpstreamUsage', () => {
     assert.deepEqual(normalizeUpstreamUsage({ output_tokens: 9 }), { prompt_tokens: null, completion_tokens: 9 });
   });
 
-  it('numeric strings are coerced', () => {
-    assert.deepEqual(normalizeUpstreamUsage({ input_tokens: '651', output_tokens: '9' }), { prompt_tokens: 651, completion_tokens: 9 });
-  });
-
   it('negative, NaN and non-numeric fields count as absent', () => {
     assert.deepEqual(normalizeUpstreamUsage({ input_tokens: -1, output_tokens: 'nine' }), null);
     assert.deepEqual(normalizeUpstreamUsage({ input_tokens: NaN, output_tokens: 4 }), { prompt_tokens: null, completion_tokens: 4 });
@@ -54,11 +50,28 @@ describe('normalizeUpstreamUsage', () => {
   });
 });
 
-describe('describeUsageSource', () => {
-  it('"upstream" only when both counters came from upstream; otherwise "estimated"', () => {
-    assert.equal(describeUsageSource({ prompt_tokens: 651, completion_tokens: 9 }), 'upstream');
-    assert.equal(describeUsageSource({ prompt_tokens: 651, completion_tokens: null }), 'estimated');
-    assert.equal(describeUsageSource(null), 'estimated');
+describe('reportUsage (resolveUsage + one log line per response)', () => {
+  it('logs source=upstream only when both counters came from upstream; otherwise source=estimated', () => {
+    const { logger } = require('../src/utils/logger.js');
+    const estimate = () => ({ prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 });
+    const lines = [];
+    const original = logger.info;
+    logger.info = (message, tag) => { lines.push(`[${tag}] ${message}`); };
+    try {
+      assert.deepEqual(
+        reportUsage({ prompt_tokens: 651, completion_tokens: 9 }, estimate, 'T'),
+        { prompt_tokens: 651, completion_tokens: 9, total_tokens: 660 }
+      );
+      reportUsage({ prompt_tokens: 651, completion_tokens: null }, estimate, 'T');
+      reportUsage(null, estimate, 'T');
+    } finally {
+      logger.info = original;
+    }
+    assert.deepEqual(lines, [
+      '[T] usage source=upstream input=651 output=9',
+      '[T] usage source=estimated input=651 output=3',
+      '[T] usage source=estimated input=8 output=3'
+    ]);
   });
 });
 

@@ -1,5 +1,5 @@
 const { isJson, generateUUID } = require('../utils/tools.js')
-const { createUsageObject, mergeUpstreamUsage, resolveUsage, describeUsageSource } = require('../utils/precise-tokenizer.js')
+const { createUsageObject, mergeUpstreamUsage, reportUsage } = require('../utils/precise-tokenizer.js')
 const { sendChatRequest } = require('../utils/request.js')
 const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js')
 const {
@@ -282,10 +282,7 @@ const runWithSSEHeartbeat = async (res, work, intervalMs = 15000) => {
 const normalizeAgentUsage = (attempt, requestBody, completionText) => {
     // attempt.upstreamUsage：runtime 逐帧累计的上游 usage（DashScope 命名已归一化；null = 没报）。
     // 只对上游没报的字段补本地估算。
-    const upstreamUsage = attempt?.upstreamUsage ?? null
-    const usage = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || [], completionText, null))
-    logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${usage.prompt_tokens} output=${usage.completion_tokens}`, 'CHAT')
-    return usage
+    return reportUsage(attempt?.upstreamUsage ?? null, () => createUsageObject(requestBody?.messages || [], completionText), 'CHAT')
 }
 
 /**
@@ -1050,12 +1047,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         }
 
         // 计算最终的token使用量：只对上游没报的字段补本地估算
-        totalTokens = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || promptText, completionContent, null))
-        logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${totalTokens.prompt_tokens} output=${totalTokens.completion_tokens}`, 'CHAT')
-
-        totalTokens.prompt_tokens = Math.max(0, totalTokens.prompt_tokens || 0)
-        totalTokens.completion_tokens = Math.max(0, totalTokens.completion_tokens || 0)
-        totalTokens.total_tokens = totalTokens.prompt_tokens + totalTokens.completion_tokens
+        totalTokens = reportUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || promptText, completionContent), 'CHAT')
 
         // Daily stats 累计——一次性归属到主请求账户
         // 注：tool_choice=required retry 走的可能是另一个账户，但 retry 路径罕见，
@@ -1412,12 +1404,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
 
         // 计算最终的token使用量：只对上游没报的字段补本地估算
         //（推理内容计入 completion，与 DeepSeek 一致；旧版 fullReasoning 为空）
-        totalTokens = resolveUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || promptText, fullReasoning + fullContent, null))
-        logger.info(`usage source=${describeUsageSource(upstreamUsage)} input=${totalTokens.prompt_tokens} output=${totalTokens.completion_tokens}`, 'CHAT')
-
-        totalTokens.prompt_tokens = Math.max(0, totalTokens.prompt_tokens || 0)
-        totalTokens.completion_tokens = Math.max(0, totalTokens.completion_tokens || 0)
-        totalTokens.total_tokens = totalTokens.prompt_tokens + totalTokens.completion_tokens
+        totalTokens = reportUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || promptText, fullReasoning + fullContent), 'CHAT')
 
         // Daily stats 累计——一次性归属到主请求账户（同 stream 分支注释）
         attributeChatUsage(options.currentAccount, totalTokens)
