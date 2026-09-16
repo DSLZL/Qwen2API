@@ -4,6 +4,7 @@
  */
 
 const tiktoken = require('tiktoken')
+const { logger } = require('./logger.js')
 
 /**
  * 使用tiktoken进行精准token计数
@@ -68,23 +69,13 @@ function countMessagesTokens(messages, model = 'gpt-3.5-turbo') {
 }
 
 /**
- * 创建精准的usage对象
+ * 本地估算的 usage 对象（只在上游没报时用，见 reportUsage）
  * @param {Array|string} promptMessages - 提示消息或文本
  * @param {string} completionText - 完成文本
- * @param {object} realUsage - 真实的usage数据（如果有）
  * @param {string} model - 模型名称
  * @returns {object} usage对象
  */
-function createUsageObject(promptMessages, completionText = '', realUsage = null, model = 'gpt-3.5-turbo') {
-  // 如果有真实的usage数据，优先使用
-  if (realUsage && realUsage.prompt_tokens && realUsage.completion_tokens) {
-    return {
-      prompt_tokens: realUsage.prompt_tokens,
-      completion_tokens: realUsage.completion_tokens,
-      total_tokens: realUsage.total_tokens || (realUsage.prompt_tokens + realUsage.completion_tokens)
-    }
-  }
-
+function createUsageObject(promptMessages, completionText = '', model = 'gpt-3.5-turbo') {
   // 计算prompt tokens
   let promptTokens = 0
   if (Array.isArray(promptMessages)) {
@@ -103,8 +94,88 @@ function createUsageObject(promptMessages, completionText = '', realUsage = null
   }
 }
 
+/**
+ * 把上游帧里的一个计数字段转成有效数字：负数、NaN、非数字、
+ * 以及 0（上游"没数"时也发 0）都当作"没报"→ null。
+ */
+function toReportedCount(value) {
+  return (typeof value === 'number' && Number.isFinite(value) && value > 0) ? value : null
+}
+
+function firstReportedCount(raw, keys) {
+  for (const key of keys) {
+    const count = toReportedCount(raw[key])
+    if (count !== null) return count
+  }
+  return null
+}
+
+/**
+ * 上游 usage 归一化。Qwen（DashScope 命名）发 input_tokens / output_tokens，
+ * OpenAI 命名发 prompt_tokens / completion_tokens；统一成 OpenAI 命名。
+ * 没报的字段为 null，让调用方只补估算那一个字段。
+ * @param {*} raw - 上游帧里的 usage 对象
+ * @returns {{prompt_tokens: number|null, completion_tokens: number|null}|null} 一个可用字段都没有时返回 null
+ */
+function normalizeUpstreamUsage(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const prompt_tokens = firstReportedCount(raw, ['input_tokens', 'prompt_tokens'])
+  const completion_tokens = firstReportedCount(raw, ['output_tokens', 'completion_tokens'])
+  if (prompt_tokens === null && completion_tokens === null) return null
+  return { prompt_tokens, completion_tokens }
+}
+
+/**
+ * 逐帧累积上游 usage。Qwen 每个 typing 帧都带累计值，最后的 finished 帧不带：
+ * 报了的字段以最后一次为准，没报的保持已累积的值。
+ * @param {{prompt_tokens: number|null, completion_tokens: number|null}|null} acc - 累积值（初始 null）
+ * @param {*} rawFrameUsage - 当前帧的 usage
+ */
+function mergeUpstreamUsage(acc, rawFrameUsage) {
+  const frame = normalizeUpstreamUsage(rawFrameUsage)
+  if (!frame) return acc
+  return {
+    prompt_tokens: frame.prompt_tokens ?? acc?.prompt_tokens ?? null,
+    completion_tokens: frame.completion_tokens ?? acc?.completion_tokens ?? null
+  }
+}
+
+/**
+ * 只对上游没报的字段补本地估算；两项都有时不调用估算（tiktoken 有成本）。
+ * @param {{prompt_tokens: number|null, completion_tokens: number|null}|null} acc - 累积的上游 usage
+ * @param {() => {prompt_tokens: number, completion_tokens: number}} estimate - 惰性本地估算
+ * @returns {{prompt_tokens: number, completion_tokens: number, total_tokens: number}}
+ */
+function resolveUsage(acc, estimate) {
+  const upstreamPrompt = acc?.prompt_tokens ?? null
+  const upstreamCompletion = acc?.completion_tokens ?? null
+  const estimated = (upstreamPrompt === null || upstreamCompletion === null) ? estimate() : null
+  const prompt_tokens = upstreamPrompt ?? (estimated.prompt_tokens || 0)
+  const completion_tokens = upstreamCompletion ?? (estimated.completion_tokens || 0)
+  return { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens }
+}
+
+/**
+ * resolveUsage + 每个响应一行日志。来源：两项都来自上游是 "upstream"；
+ * 哪怕只有一项是本地估算的也算 "estimated"。
+ * @param {{prompt_tokens: number|null, completion_tokens: number|null}|null} acc - 累积的上游 usage
+ * @param {() => {prompt_tokens: number, completion_tokens: number}} estimate - 惰性本地估算
+ * @param {string} tag - 日志模块标签（'ANTHROPIC' / 'CHAT'）
+ * @returns {{prompt_tokens: number, completion_tokens: number, total_tokens: number}}
+ */
+function reportUsage(acc, estimate, tag) {
+  let source = 'upstream'
+  const usage = resolveUsage(acc, () => { source = 'estimated'; return estimate() })
+  logger.info(`usage source=${source} input=${usage.prompt_tokens} output=${usage.completion_tokens}`, tag)
+  return usage
+}
+
 module.exports = {
   countTokens,
   countMessagesTokens,
-  createUsageObject
+  createUsageObject,
+  normalizeUpstreamUsage,
+  mergeUpstreamUsage,
+  resolveUsage,
+  reportUsage
 }
